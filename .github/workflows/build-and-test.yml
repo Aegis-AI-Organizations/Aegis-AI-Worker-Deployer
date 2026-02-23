@@ -1,0 +1,16 @@
+name: Module - Build & Test
+on: workflow_call
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Build
+        run: if [ -f go.mod ]; then go build -v ./...; else echo "No go.mod, skipping"; fi
+      - name: Run tests
+        run: if [ -f go.mod ]; then go test -v ./...; else echo "No go.mod, skipping"; fi

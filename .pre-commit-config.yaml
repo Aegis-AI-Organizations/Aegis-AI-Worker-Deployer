@@ -1,0 +1,28 @@
+repos:
+  # 1. Verification des messages de commit (Aegis Format)
+  - repo: local
+    hooks:
+      - id: check-commit-msg
+        name: Check commit message format
+        entry: >-
+          bash -c 'head -n 1 "$1" | grep -qE "^\[(ADD|FIX|UPDATE|REMOVE|DOC|REFACTOR|TEST|CI|CONFIG|MERGE|WORK|WIP)\] " || { echo -e "\033[31mInvalid commit message.\033[0m Must match: [TYPE] Message in English"; exit 1; }' --
+        language: system
+        stages: [commit-msg]
+
+  # 2. Nettoyage generique
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--unsafe]
+
+  # 3. Linter Code Go
+  - repo: https://github.com/golangci/golangci-lint
+    rev: v1.60.2
+    hooks:
+      - id: golangci-lint
+        entry: bash -c 'if [ -f "go.mod" ]; then golangci-lint run; else echo "Skipping golangci-lint since go.mod is not present"; fi'
+        language: system
+        types: [go]
