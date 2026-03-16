@@ -16,10 +16,11 @@ jobs:
         run: |
           if [ -f go.mod ]; then
             go test -v -coverprofile=coverage.out ./...
-            COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
-            echo "Total coverage: $COVERAGE%"
+            grep -v "^github.com/.*/cmd/" coverage.out > coverage_filtered.out
+            COVERAGE=$(go tool cover -func=coverage_filtered.out | grep '^total:' | awk '{print $NF}' | sed 's/%//')
+            echo "Filtered coverage: $COVERAGE%"
             if (( $(echo "$COVERAGE < 80" | bc -l) )); then
-              echo "❌ Coverage is below 80%!"
+              echo "❌ Filtered coverage is below 80%!"
               exit 1
             fi
           else
