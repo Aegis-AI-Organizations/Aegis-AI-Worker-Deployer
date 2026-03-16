@@ -9,14 +9,14 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.25.x'
       - name: Build
         run: if [ -f go.mod ]; then go build -v ./...; else echo "No go.mod, skipping"; fi
       - name: Run tests with coverage
         run: |
           if [ -f go.mod ]; then
-            go test -v -coverprofile=coverage.out ./...
-            grep -v "^github.com/.*/cmd/" coverage.out > coverage_filtered.out
+            go list ./... | grep -v '/cmd/' | xargs go test -v -coverprofile=coverage.out
+            cp coverage.out coverage_filtered.out
             COVERAGE=$(go tool cover -func=coverage_filtered.out | grep '^total:' | awk '{print $NF}' | sed 's/%//')
             echo "Filtered coverage: $COVERAGE%"
             if (( $(echo "$COVERAGE < 80" | bc -l) )); then
