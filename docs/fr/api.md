@@ -1,4 +1,4 @@
-# [FR] # API Reference: Worker Deployer
+# API Reference: Worker Deployer
 
 The `Aegis-AI-Worker-Deployer` exposes a fast and secure API for interacting with the infrastructure.
 
