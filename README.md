@@ -1,34 +1,75 @@
-# 🏗️ Aegis AI - Worker Pool: Deployer
+# 🏗️ Aegis AI — Deployer Worker
 
 **Project ID:** AEGIS-CORE-2026
 
-## 🎯 System Architecture & Role
-The **Aegis AI Worker Deployer** is the "Digital Twin" rendering engine. Managed by the Temporal Control Plane, this Go-based worker reconstructs an exact, isolated replica of the client's live infrastructure based on the telemetry and network graphs ingested by our Rust Agents.
+> The **Aegis AI Deployer Worker** is the platform's "Digital Twin" rendering engine. Orchestrated by **Temporal**, these Go-based workers reconstruct isolated, exact replicas of a client's live infrastructure based on telemetry graphs, enabling safe and intensive offensive security testing.
 
-* **Tech Stack:** Go (Golang), Kubernetes `client-go`, Neo4j Driver (Graph Traversal), ClickHouse SDK.
-* **Role:**
-  * **State Ingestion:** Reads the current architectural state of the client (services, network policies, open ports) built from the `aegis-worker-ingest` pipeline.
-  * **On-the-fly Translation:** Converts graph topologies and logs into deployable Kubernetes manifests or Terraform states.
-  * **Clone Deployment:** Provisions the ephemeral sandboxes in an isolated environment (utilizing gVisor for kernel isolation and Cilium for strict network bounding).
-  * **Handoff:** Signals the Brain orchestrator that the Digital Twin is ready for offensive security testing.
-* **Architecture Justification:** Go is the industry standard for cloud-native orchestration. Its native integration with Kubernetes SDKs allows the Deployer to rapidly translate complex graphs into live, sandboxed environments with minimal latency.
+---
 
-## 🔐 Security & DevSecOps Mandates
-* **Air-Gapped Execution:** The cloned environments deployed by this worker have absolutely no outbound internet access or routing back to the client's real production environment.
-* **Secret Injection:** All cluster credentials and deployment identities are injected dynamically into the worker's memory via **Infisical**.
+## 🏗️ Role in the Ecosystem
 
-## 🐳 Docker Deployment
-Designed to scale horizontally to support parallel Digital Twin generation for multiple clients.
+The Deployer acts as the bridge between "Ingested Data" and "Actionable Sandboxes".
+
+- **Digital Twin Generation**: Translates network graphs from Neo4j into deployable Kubernetes manifests.
+- **Sandbox Provisioning**: Automates the lifecycle of ephemeral environments in isolated `sandbox-*` namespaces.
+- **Security Bounding**: Configures **gVisor** runtimes and **Cilium** policies for the cloned environment to prevent cluster-wide leaks.
+
+```mermaid
+graph TD
+    Neo4j[(Neo4j Graph)] -- "Topology Data" --> Deployer[Deployer Worker (Go)]
+    Deployer -- "Render" --> K8s[Target K8s Cluster]
+    K8s -- "Deploy" --> Sandbox[Isolated Digital Twin]
+    Sandbox -- "Ready" --> Brain[Brain Orchestrator]
+```
+
+---
+
+## 🛠️ Tech Stack
+
+| Component | Technology | Version |
+|---|---|---|
+| Language | **Go** | 1.22+ |
+| K8s Integration | **client-go**, Helm SDK | — |
+| Graph Engine | Neo4j Go Driver | — |
+| Orchestration | **Temporal SDK** | 1.x |
+
+---
+
+## 🔐 Security & Isolation
+
+- **Kernel Isolation**: All Digital Twins are deployed using the **gVisor** (`runsc`) runtime class.
+- **Air-Gapped Networking**: Enforces strict network policies that block all outbound traffic from the sandbox to the internal Aegis Core or the public internet (unless whitelisted).
+- **Environment Sanitation**: Automatically rotates secrets and sanitizes sensitive data before cloning.
+
+---
+
+## 🐳 Deployment (Kubernetes)
+
+Autoscaled by **KEDA** to handle parallel twin generation for multiple customer campaigns.
+
+```yaml
+# Helm values example
+image:
+  repository: ghcr.io/aegis-ai/aegis-worker-deployer
+  tag: latest
+keda:
+  enabled: true
+  minReplicas: 0
+  maxReplicas: 10
+```
+
+---
+
+## 🛠️ Development
 
 ```bash
-docker pull ghcr.io/aegis-ai/aegis-worker-deployer:latest
+# Run locally
+go run main.go
 
-infisical run --env=prod -- docker run -d \
-  --name aegis-worker-deployer \
-  --read-only \
-  --cap-drop=ALL \
-  --security-opt no-new-privileges:true \
-  --user 10001:10001 \
-  -e TEMPORAL_ADDRESS="temporal.aegis.internal:7233" \
-  -e INFISICAL_TOKEN=$INFISICAL_TOKEN \
-  ghcr.io/aegis-ai/aegis-worker-deployer:latest
+# Run unit tests
+go test ./...
+```
+
+---
+
+*Aegis AI — Infrastructure & Digital Twins — 2026*
