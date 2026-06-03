@@ -11,8 +11,13 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+
+	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
 )
 
 func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
@@ -296,4 +301,122 @@ func TestNewKubernetesClientReturnsErrorForInvalidKubeconfig(t *testing.T) {
 	if _, err := newKubernetesClient(); err == nil {
 		t.Fatalf("expected kubeconfig error")
 	}
+}
+
+func TestRun_KubernetesClientError(t *testing.T) {
+	// Backup and restore globals
+	origNewK8s := newK8sClient
+	defer func() { newK8sClient = origNewK8s }()
+
+	newK8sClient = func() (kubernetes.Interface, error) {
+		return nil, errors.New("fake k8s error")
+	}
+
+	err := Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "fake k8s error") {
+		t.Fatalf("expected fake k8s error, got %v", err)
+	}
+}
+
+type testMockClient struct {
+	client.Client
+}
+
+func (m *testMockClient) Close() {}
+
+type testMockWorker struct {
+	worker.Worker
+}
+
+func (m *testMockWorker) RegisterActivityWithOptions(activity interface{}, options activity.RegisterOptions) {
+	// noop
+}
+
+func (m *testMockWorker) Run(interruptCh <-chan interface{}) error {
+	return nil
+}
+
+func TestRun_TemporalConnectionFailureAndSuccess(t *testing.T) {
+	// Backup and restore globals
+	origNewK8s := newK8sClient
+	origDial := temporalDial
+	origNewWorker := newWorker
+	origAttempts := temporalConnectMaxAttempts
+	origDelay := temporalConnectRetryDelay
+	defer func() {
+		newK8sClient = origNewK8s
+		temporalDial = origDial
+		newWorker = origNewWorker
+		temporalConnectMaxAttempts = origAttempts
+		temporalConnectRetryDelay = origDelay
+	}()
+
+	newK8sClient = func() (kubernetes.Interface, error) {
+		return fake.NewSimpleClientset(), nil
+	}
+
+	temporalConnectRetryDelay = 1 * time.Millisecond
+
+	t.Run("fails after max attempts", func(t *testing.T) {
+		temporalConnectMaxAttempts = 3
+		dialCount := 0
+		temporalDial = func(options client.Options) (client.Client, error) {
+			dialCount++
+			return nil, errors.New("dial failed")
+		}
+
+		err := Run(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "connect temporal: dial failed") {
+			t.Fatalf("expected connection error, got %v", err)
+		}
+		if dialCount != 3 {
+			t.Fatalf("expected 3 dial attempts, got %d", dialCount)
+		}
+	})
+
+	t.Run("succeeds after retrying", func(t *testing.T) {
+		temporalConnectMaxAttempts = 5
+		dialCount := 0
+		temporalDial = func(options client.Options) (client.Client, error) {
+			dialCount++
+			if dialCount < 3 {
+				return nil, errors.New("dial failed temporary")
+			}
+			return &testMockClient{}, nil
+		}
+
+		workerCreated := false
+		newWorker = func(c client.Client, taskQueue string, options worker.Options) worker.Worker {
+			workerCreated = true
+			return &testMockWorker{}
+		}
+
+		err := Run(context.Background())
+		if err != nil {
+			t.Fatalf("expected successful Run, got error: %v", err)
+		}
+		if dialCount != 3 {
+			t.Fatalf("expected 3 dial attempts before success, got %d", dialCount)
+		}
+		if !workerCreated {
+			t.Fatalf("expected worker to be created")
+		}
+	})
+
+	t.Run("respects context cancellation during retry", func(t *testing.T) {
+		temporalConnectMaxAttempts = 5
+		dialCount := 0
+
+		ctx, cancel := context.WithCancel(context.Background())
+		temporalDial = func(options client.Options) (client.Client, error) {
+			dialCount++
+			cancel()
+			return nil, errors.New("dial failed")
+		}
+
+		err := Run(ctx)
+		if err == nil || !strings.Contains(err.Error(), "connect temporal cancelled") {
+			t.Fatalf("expected cancelled error, got %v", err)
+		}
+	})
 }

@@ -30,6 +30,14 @@ const (
 	sandboxNamespacePrefix   = "aegis-war-room-"
 )
 
+var (
+	newK8sClient               = newKubernetesClient
+	temporalDial               = client.Dial
+	newWorker                  = worker.New
+	temporalConnectMaxAttempts = 30
+	temporalConnectRetryDelay  = 2 * time.Second
+)
+
 type SandboxRequest struct {
 	ScanID      string `json:"scan_id"`
 	TargetImage string `json:"target_image"`
@@ -57,7 +65,7 @@ func Start() {
 func Run(ctx context.Context) error {
 	_ = ctx
 
-	k8s, err := newKubernetesClient()
+	k8s, err := newK8sClient()
 	if err != nil {
 		return fmt.Errorf("create kubernetes client: %w", err)
 	}
@@ -67,13 +75,12 @@ func Run(ctx context.Context) error {
 	temporalNamespace := getenv("TEMPORAL_NAMESPACE", defaultTemporalNamespace)
 
 	// Attempt to connect to Temporal with retries to handle startup delay / transient network issues
-	const maxAttempts = 30
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	for attempt := 1; attempt <= temporalConnectMaxAttempts; attempt++ {
 		if err = ctx.Err(); err != nil {
 			return fmt.Errorf("connect temporal cancelled: %w", err)
 		}
 
-		temporalClient, err = client.Dial(client.Options{
+		temporalClient, err = temporalDial(client.Options{
 			HostPort:  temporalHost,
 			Namespace: temporalNamespace,
 		})
@@ -81,12 +88,12 @@ func Run(ctx context.Context) error {
 			break
 		}
 
-		log.Printf("Failed to connect to Temporal at %s (attempt %d/%d): %v", temporalHost, attempt, maxAttempts, err)
-		if attempt < maxAttempts {
+		log.Printf("Failed to connect to Temporal at %s (attempt %d/%d): %v", temporalHost, attempt, temporalConnectMaxAttempts, err)
+		if attempt < temporalConnectMaxAttempts {
 			select {
 			case <-ctx.Done():
 				return fmt.Errorf("connect temporal cancelled: %w", ctx.Err())
-			case <-time.After(2 * time.Second):
+			case <-time.After(temporalConnectRetryDelay):
 			}
 		}
 	}
@@ -95,7 +102,7 @@ func Run(ctx context.Context) error {
 	}
 	defer temporalClient.Close()
 
-	w := worker.New(temporalClient, getenv("DEPLOYER_TASK_QUEUE", defaultTaskQueue), worker.Options{})
+	w := newWorker(temporalClient, getenv("DEPLOYER_TASK_QUEUE", defaultTaskQueue), worker.Options{})
 	activities := NewActivities(k8s)
 	w.RegisterActivityWithOptions(activities.CreateSandbox, activity.RegisterOptions{Name: "CreateSandbox"})
 	w.RegisterActivityWithOptions(activities.DestroySandbox, activity.RegisterOptions{Name: "DestroySandbox"})
