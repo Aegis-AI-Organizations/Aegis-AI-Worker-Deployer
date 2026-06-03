@@ -3,6 +3,7 @@ package deployer
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -285,6 +286,71 @@ func TestHelpers(t *testing.T) {
 	if got := getenv("AEGIS_TEST_VALUE", "fallback"); got != "fallback" {
 		t.Fatalf("unexpected fallback value: %s", got)
 	}
+
+	t.Setenv("AEGIS_TEST_BOOL", "yes")
+	if !envBool("AEGIS_TEST_BOOL") {
+		t.Fatalf("expected yes to be parsed as true")
+	}
+	t.Setenv("AEGIS_TEST_BOOL", "no")
+	if envBool("AEGIS_TEST_BOOL") {
+		t.Fatalf("expected no to be parsed as false")
+	}
+}
+
+func TestTemporalClientOptionsWithoutTLS(t *testing.T) {
+	t.Setenv("TEMPORAL_TLS_ENABLE", "false")
+
+	options, err := temporalClientOptions("temporal:7233", "default")
+	if err != nil {
+		t.Fatalf("temporalClientOptions returned error: %v", err)
+	}
+	if options.HostPort != "temporal:7233" {
+		t.Fatalf("unexpected host: %s", options.HostPort)
+	}
+	if options.Namespace != "default" {
+		t.Fatalf("unexpected namespace: %s", options.Namespace)
+	}
+	if options.ConnectionOptions.TLS != nil {
+		t.Fatalf("expected plaintext temporal options")
+	}
+}
+
+func TestTemporalClientOptionsWithTLS(t *testing.T) {
+	t.Setenv("TEMPORAL_TLS_ENABLE", "true")
+	t.Setenv("TEMPORAL_TLS_SERVER_NAME", "temporal.internal")
+
+	options, err := temporalClientOptions("temporal:7233", "default")
+	if err != nil {
+		t.Fatalf("temporalClientOptions returned error: %v", err)
+	}
+	if options.ConnectionOptions.TLS == nil {
+		t.Fatalf("expected TLS config")
+	}
+	if options.ConnectionOptions.TLS.ServerName != "temporal.internal" {
+		t.Fatalf("unexpected server name: %s", options.ConnectionOptions.TLS.ServerName)
+	}
+}
+
+func TestTemporalTLSConfigValidationErrors(t *testing.T) {
+	t.Run("invalid ca", func(t *testing.T) {
+		caFile := t.TempDir() + "/ca.crt"
+		if err := os.WriteFile(caFile, []byte("not a cert"), 0o600); err != nil {
+			t.Fatalf("write ca: %v", err)
+		}
+		t.Setenv("TEMPORAL_TLS_CA_PATH", caFile)
+
+		if _, err := temporalTLSConfig(); err == nil || !strings.Contains(err.Error(), "parse ca certificate") {
+			t.Fatalf("expected ca parse error, got %v", err)
+		}
+	})
+
+	t.Run("missing key", func(t *testing.T) {
+		t.Setenv("TEMPORAL_TLS_CERT_PATH", "/tmp/client.crt")
+
+		if _, err := temporalTLSConfig(); err == nil || !strings.Contains(err.Error(), "must be configured together") {
+			t.Fatalf("expected paired cert/key error, got %v", err)
+		}
+	})
 }
 
 func TestNewKubernetesClientReturnsErrorWithoutConfig(t *testing.T) {

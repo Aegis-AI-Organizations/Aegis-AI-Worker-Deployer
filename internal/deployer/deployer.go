@@ -2,6 +2,8 @@ package deployer
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -34,7 +36,7 @@ var (
 	newK8sClient               = newKubernetesClient
 	temporalDial               = client.Dial
 	newWorker                  = worker.New
-	temporalConnectMaxAttempts = 30
+	temporalConnectMaxAttempts = 0
 	temporalConnectRetryDelay  = 2 * time.Second
 )
 
@@ -73,32 +75,31 @@ func Run(ctx context.Context) error {
 	var temporalClient client.Client
 	temporalHost := getenv("TEMPORAL_HOST", defaultTemporalHost)
 	temporalNamespace := getenv("TEMPORAL_NAMESPACE", defaultTemporalNamespace)
+	temporalOptions, err := temporalClientOptions(temporalHost, temporalNamespace)
+	if err != nil {
+		return err
+	}
 
-	// Attempt to connect to Temporal with retries to handle startup delay / transient network issues
-	for attempt := 1; attempt <= temporalConnectMaxAttempts; attempt++ {
+	for attempt := 1; ; attempt++ {
 		if err = ctx.Err(); err != nil {
 			return fmt.Errorf("connect temporal cancelled: %w", err)
 		}
 
-		temporalClient, err = temporalDial(client.Options{
-			HostPort:  temporalHost,
-			Namespace: temporalNamespace,
-		})
+		temporalClient, err = temporalDial(temporalOptions)
 		if err == nil {
 			break
 		}
 
-		log.Printf("Failed to connect to Temporal at %s (attempt %d/%d): %v", temporalHost, attempt, temporalConnectMaxAttempts, err)
-		if attempt < temporalConnectMaxAttempts {
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("connect temporal cancelled: %w", ctx.Err())
-			case <-time.After(temporalConnectRetryDelay):
-			}
+		if temporalConnectMaxAttempts > 0 && attempt >= temporalConnectMaxAttempts {
+			return fmt.Errorf("connect temporal: %w", err)
 		}
-	}
-	if err != nil {
-		return fmt.Errorf("connect temporal: %w", err)
+
+		log.Printf("Failed to connect to Temporal at %s (attempt %d): %v", temporalHost, attempt, err)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("connect temporal cancelled: %w", ctx.Err())
+		case <-time.After(temporalConnectRetryDelay):
+		}
 	}
 	defer temporalClient.Close()
 
@@ -109,6 +110,57 @@ func Run(ctx context.Context) error {
 
 	log.Printf("Aegis AI Worker Deployer listening on queue %s", getenv("DEPLOYER_TASK_QUEUE", defaultTaskQueue))
 	return w.Run(worker.InterruptCh())
+}
+
+func temporalClientOptions(host, namespace string) (client.Options, error) {
+	options := client.Options{
+		HostPort:  host,
+		Namespace: namespace,
+	}
+	if !envBool("TEMPORAL_TLS_ENABLE") {
+		return options, nil
+	}
+
+	tlsConfig, err := temporalTLSConfig()
+	if err != nil {
+		return client.Options{}, fmt.Errorf("configure temporal tls: %w", err)
+	}
+	options.ConnectionOptions.TLS = tlsConfig
+	return options, nil
+}
+
+func temporalTLSConfig() (*tls.Config, error) {
+	config := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: getenv("TEMPORAL_TLS_SERVER_NAME", ""),
+	}
+
+	if caPath := getenv("TEMPORAL_TLS_CA_PATH", ""); caPath != "" {
+		caPEM, err := os.ReadFile(caPath)
+		if err != nil {
+			return nil, fmt.Errorf("read ca certificate: %w", err)
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(caPEM) {
+			return nil, errors.New("parse ca certificate")
+		}
+		config.RootCAs = roots
+	}
+
+	certPath := getenv("TEMPORAL_TLS_CERT_PATH", "")
+	keyPath := getenv("TEMPORAL_TLS_KEY_PATH", "")
+	if certPath == "" && keyPath == "" {
+		return config, nil
+	}
+	if certPath == "" || keyPath == "" {
+		return nil, errors.New("TEMPORAL_TLS_CERT_PATH and TEMPORAL_TLS_KEY_PATH must be configured together")
+	}
+	certificate, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load client certificate: %w", err)
+	}
+	config.Certificates = []tls.Certificate{certificate}
+	return config, nil
 }
 
 func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (SandboxResponse, error) {
@@ -326,4 +378,13 @@ func getenv(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func envBool(key string) bool {
+	switch strings.ToLower(getenv(key, "")) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
