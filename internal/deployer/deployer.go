@@ -62,10 +62,34 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("create kubernetes client: %w", err)
 	}
 
-	temporalClient, err := client.Dial(client.Options{
-		HostPort:  getenv("TEMPORAL_HOST", defaultTemporalHost),
-		Namespace: getenv("TEMPORAL_NAMESPACE", defaultTemporalNamespace),
-	})
+	var temporalClient client.Client
+	temporalHost := getenv("TEMPORAL_HOST", defaultTemporalHost)
+	temporalNamespace := getenv("TEMPORAL_NAMESPACE", defaultTemporalNamespace)
+
+	// Attempt to connect to Temporal with retries to handle startup delay / transient network issues
+	const maxAttempts = 30
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err = ctx.Err(); err != nil {
+			return fmt.Errorf("connect temporal cancelled: %w", err)
+		}
+
+		temporalClient, err = client.Dial(client.Options{
+			HostPort:  temporalHost,
+			Namespace: temporalNamespace,
+		})
+		if err == nil {
+			break
+		}
+
+		log.Printf("Failed to connect to Temporal at %s (attempt %d/%d): %v", temporalHost, attempt, maxAttempts, err)
+		if attempt < maxAttempts {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("connect temporal cancelled: %w", ctx.Err())
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("connect temporal: %w", err)
 	}
