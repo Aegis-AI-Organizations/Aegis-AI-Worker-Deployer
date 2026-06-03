@@ -20,6 +20,12 @@ jobs:
       with:
         go-version: 'stable'
 
+    - name: Install golangci-lint
+      if: hashFiles('go.mod') != ''
+      run: |
+        curl -sSfL https://golangci-lint.run/install.sh \
+          | sh -s -- -b "$(go env GOPATH)/bin" v2.11.4
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
     - name: Run code linters (pre-commit)
       uses: pre-commit/action@v3.0.1
