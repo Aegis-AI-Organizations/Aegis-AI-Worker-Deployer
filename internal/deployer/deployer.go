@@ -243,7 +243,6 @@ func (a *Activities) createNamespace(ctx context.Context, namespace, scanID stri
 }
 
 func (a *Activities) createPod(ctx context.Context, namespace, podName, scanID, image string) error {
-	runtimeClassName := "gvisor"
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: podName,
@@ -261,8 +260,7 @@ func (a *Activities) createPod(ctx context.Context, namespace, podName, scanID, 
 					ContainerPort: 80,
 				}},
 			}},
-			RuntimeClassName: &runtimeClassName,
-			RestartPolicy:    corev1.RestartPolicyNever,
+			RestartPolicy: corev1.RestartPolicyNever,
 		},
 	}
 

@@ -24,13 +24,6 @@ import (
 func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 	ctx := context.Background()
 	k8s := fake.NewSimpleClientset()
-	var createdRuntimeClass *string
-	k8s.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		createAction := action.(k8stesting.CreateAction)
-		pod := createAction.GetObject().(*corev1.Pod)
-		createdRuntimeClass = pod.Spec.RuntimeClassName
-		return false, nil, nil
-	})
 	k8s.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		getAction := action.(k8stesting.GetAction)
 		if getAction.GetName() != "target-scan-1" {
@@ -68,9 +61,6 @@ func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 	}
 	if _, err := k8s.CoreV1().Pods(response.Namespace).Get(ctx, "target-scan-1", metav1.GetOptions{}); err != nil {
 		t.Fatalf("pod was not created: %v", err)
-	}
-	if createdRuntimeClass == nil || *createdRuntimeClass != "gvisor" {
-		t.Fatalf("unexpected runtime class: %v", createdRuntimeClass)
 	}
 	if _, err := k8s.CoreV1().Services(response.Namespace).Get(ctx, "svc-scan-1", metav1.GetOptions{}); err != nil {
 		t.Fatalf("service was not created: %v", err)
