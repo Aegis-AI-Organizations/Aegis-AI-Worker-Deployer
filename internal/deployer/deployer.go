@@ -75,6 +75,7 @@ func Run(ctx context.Context) error {
 	var temporalClient client.Client
 	temporalHost := getenv("TEMPORAL_HOST", defaultTemporalHost)
 	temporalNamespace := getenv("TEMPORAL_NAMESPACE", defaultTemporalNamespace)
+	log.Printf("Connecting Deployer worker to Temporal at %s (namespace=%s)...", temporalHost, temporalNamespace)
 	temporalOptions, err := temporalClientOptions(temporalHost, temporalNamespace)
 	if err != nil {
 		return err
@@ -181,22 +182,43 @@ func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (San
 	podName := "target-" + req.ScanID
 	serviceName := "svc-" + req.ScanID
 
+	log.Printf(
+		"[CreateSandbox] scan=%s image=%s namespace=%s pod=%s service=%s",
+		req.ScanID,
+		req.TargetImage,
+		namespace,
+		podName,
+		serviceName,
+	)
+
+	log.Printf("[CreateSandbox] scan=%s creating namespace %s", req.ScanID, namespace)
 	if err := a.createNamespace(ctx, namespace, req.ScanID); err != nil {
 		return SandboxResponse{}, err
 	}
+	log.Printf("[CreateSandbox] scan=%s namespace %s ready", req.ScanID, namespace)
+
+	log.Printf("[CreateSandbox] scan=%s creating pod %s/%s", req.ScanID, namespace, podName)
 	if err := a.createPod(ctx, namespace, podName, req.ScanID, req.TargetImage); err != nil {
 		return SandboxResponse{}, err
 	}
+	log.Printf("[CreateSandbox] scan=%s pod %s/%s created", req.ScanID, namespace, podName)
+
+	log.Printf("[CreateSandbox] scan=%s creating service %s/%s", req.ScanID, namespace, serviceName)
 	if err := a.createService(ctx, namespace, serviceName, req.ScanID); err != nil {
 		return SandboxResponse{}, err
 	}
+	log.Printf("[CreateSandbox] scan=%s service %s/%s created", req.ScanID, namespace, serviceName)
+
+	log.Printf("[CreateSandbox] scan=%s waiting for pod %s/%s to become Ready", req.ScanID, namespace, podName)
 	if err := a.waitForPodReady(ctx, namespace, podName, time.Minute); err != nil {
 		return SandboxResponse{}, err
 	}
 
+	endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:80", serviceName, namespace)
+	log.Printf("[CreateSandbox] scan=%s sandbox ready endpoint=%s", req.ScanID, endpoint)
 	return SandboxResponse{
 		Namespace: namespace,
-		Endpoint:  fmt.Sprintf("http://%s.%s.svc.cluster.local:80", serviceName, namespace),
+		Endpoint:  endpoint,
 	}, nil
 }
 
@@ -211,13 +233,16 @@ func (a *Activities) DestroySandbox(ctx context.Context, scanID string) (string,
 		return "", err
 	}
 
+	log.Printf("[DestroySandbox] scan=%s deleting namespace %s", scanID, namespace)
 	err := a.k8s.CoreV1().Namespaces().Delete(ctx, namespace, metav1.DeleteOptions{})
 	if apierrors.IsNotFound(err) {
+		log.Printf("[DestroySandbox] scan=%s namespace %s already absent", scanID, namespace)
 		return "CLEANED", nil
 	}
 	if err != nil {
 		return "", fmt.Errorf("delete namespace %s: %w", namespace, err)
 	}
+	log.Printf("[DestroySandbox] scan=%s namespace %s deleted", scanID, namespace)
 	return "CLEANED", nil
 }
 
@@ -234,11 +259,13 @@ func (a *Activities) createNamespace(ctx context.Context, namespace, scanID stri
 
 	_, err := a.k8s.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
+		log.Printf("[CreateSandbox] namespace %s already exists", namespace)
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("create namespace %s: %w", namespace, err)
 	}
+	log.Printf("[CreateSandbox] namespace %s created", namespace)
 	return nil
 }
 
@@ -266,11 +293,13 @@ func (a *Activities) createPod(ctx context.Context, namespace, podName, scanID, 
 
 	_, err := a.k8s.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
+		log.Printf("[CreateSandbox] pod %s/%s already exists", namespace, podName)
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("create pod %s/%s: %w", namespace, podName, err)
 	}
+	log.Printf("[CreateSandbox] pod %s/%s created with image %s", namespace, podName, image)
 	return nil
 }
 
@@ -291,11 +320,13 @@ func (a *Activities) createService(ctx context.Context, namespace, serviceName, 
 
 	_, err := a.k8s.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
+		log.Printf("[CreateSandbox] service %s/%s already exists", namespace, serviceName)
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("create service %s/%s: %w", namespace, serviceName, err)
 	}
+	log.Printf("[CreateSandbox] service %s/%s created", namespace, serviceName)
 	return nil
 }
 
@@ -306,16 +337,25 @@ func (a *Activities) waitForPodReady(ctx context.Context, namespace, podName str
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	log.Printf("[CreateSandbox] waiting for pod %s/%s readiness (timeout=%s)", namespace, podName, timeout)
+	lastSummary := ""
 	for {
 		pod, err := a.k8s.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("read pod %s/%s: %w", namespace, podName, err)
 		}
 		if err := checkImageErrors(pod); err != nil {
+			log.Printf("[CreateSandbox] pod %s/%s image error: %v", namespace, podName, err)
 			return err
+		}
+		summary := podStatusSummary(pod)
+		if summary != lastSummary {
+			log.Printf("[CreateSandbox] pod %s/%s status=%s", namespace, podName, summary)
+			lastSummary = summary
 		}
 		for _, condition := range pod.Status.Conditions {
 			if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+				log.Printf("[CreateSandbox] pod %s/%s is Ready", namespace, podName)
 				return nil
 			}
 		}
@@ -326,6 +366,33 @@ func (a *Activities) waitForPodReady(ctx context.Context, namespace, podName str
 		case <-ticker.C:
 		}
 	}
+}
+
+func podStatusSummary(pod *corev1.Pod) string {
+	containerSummaries := make([]string, 0, len(pod.Status.ContainerStatuses))
+	readyCount := 0
+	for _, status := range pod.Status.ContainerStatuses {
+		state := "unknown"
+		switch {
+		case status.State.Waiting != nil:
+			state = "waiting:" + status.State.Waiting.Reason
+		case status.State.Running != nil:
+			state = "running"
+		case status.State.Terminated != nil:
+			state = "terminated:" + status.State.Terminated.Reason
+		}
+		if status.Ready {
+			readyCount++
+		}
+		containerSummaries = append(containerSummaries, fmt.Sprintf("%s=%s", status.Name, state))
+	}
+	return fmt.Sprintf(
+		"phase=%s ready=%d/%d containers=[%s]",
+		pod.Status.Phase,
+		readyCount,
+		len(pod.Status.ContainerStatuses),
+		strings.Join(containerSummaries, ","),
+	)
 }
 
 func checkImageErrors(pod *corev1.Pod) error {
