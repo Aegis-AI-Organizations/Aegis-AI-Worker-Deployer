@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -170,6 +171,154 @@ func TestCreateSandboxAllowsExistingResources(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
+	ctx := context.Background()
+	namespace := "aegis-war-room-scan-1"
+	k8s := fake.NewSimpleClientset()
+	createdDeployments := map[string]*appsv1.Deployment{}
+	createdServices := map[string]*corev1.Service{}
+	k8s.PrependReactor("create", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		deployment := createAction.GetObject().(*appsv1.Deployment)
+		createdDeployments[deployment.Name] = deployment
+		return true, deployment, nil
+	})
+	k8s.PrependReactor("create", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		service := createAction.GetObject().(*corev1.Service)
+		createdServices[service.Name] = service
+		return true, service, nil
+	})
+	k8s.PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction := action.(k8stesting.GetAction)
+		name := getAction.GetName()
+		deployment := createdDeployments[name]
+		if deployment == nil {
+			return false, nil, nil
+		}
+		readyDeployment := deployment.DeepCopy()
+		readyDeployment.Namespace = namespace
+		readyDeployment.Generation = 1
+		readyDeployment.Status = appsv1.DeploymentStatus{
+			ObservedGeneration: 1,
+			UpdatedReplicas:    *deployment.Spec.Replicas,
+			AvailableReplicas:  *deployment.Spec.Replicas,
+		}
+		return true, readyDeployment, nil
+	})
+	activities := NewActivities(k8s)
+
+	response, err := activities.CreateSandbox(ctx, SandboxRequest{
+		ScanID: "scan-1",
+		TopologyJSON: `{
+			"services": [
+				{
+					"name": "web frontend",
+					"image": "nginx:1.27",
+					"env": {"API_URL": "http://api:8080"},
+					"ports": [{"port": 80, "container_port": 8080}]
+				},
+				{
+					"name": "api",
+					"image": "ghcr.io/aegis/api:anon",
+					"env_vars": [{"name": "DB_HOST", "value": "postgres"}],
+					"ports": [{"name": "http", "port": 8080}]
+				}
+			]
+		}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox returned error: %v", err)
+	}
+	if response.Namespace != namespace {
+		t.Fatalf("unexpected namespace: %s", response.Namespace)
+	}
+	if response.Endpoint != "http://web-frontend.aegis-war-room-scan-1.svc.cluster.local:80" {
+		t.Fatalf("unexpected endpoint: %s", response.Endpoint)
+	}
+
+	webDeployment := createdDeployments["web-frontend"]
+	if webDeployment == nil {
+		t.Fatalf("web deployment was not created: %v", err)
+	}
+	webContainer := webDeployment.Spec.Template.Spec.Containers[0]
+	if webContainer.Image != "nginx:1.27" {
+		t.Fatalf("unexpected web image: %s", webContainer.Image)
+	}
+	if len(webContainer.Env) != 1 || webContainer.Env[0].Name != "API_URL" || webContainer.Env[0].Value != "http://api:8080" {
+		t.Fatalf("unexpected web env: %#v", webContainer.Env)
+	}
+	if len(webContainer.Ports) != 1 || webContainer.Ports[0].ContainerPort != 8080 {
+		t.Fatalf("unexpected web ports: %#v", webContainer.Ports)
+	}
+
+	webService := createdServices["web-frontend"]
+	if webService == nil {
+		t.Fatalf("web service was not created: %v", err)
+	}
+	if webService.Spec.Ports[0].Port != 80 || webService.Spec.Ports[0].TargetPort.IntVal != 8080 {
+		t.Fatalf("unexpected web service port: %#v", webService.Spec.Ports[0])
+	}
+
+	apiDeployment := createdDeployments["api"]
+	if apiDeployment == nil {
+		t.Fatalf("api deployment was not created: %v", err)
+	}
+	apiContainer := apiDeployment.Spec.Template.Spec.Containers[0]
+	if len(apiContainer.Env) != 1 || apiContainer.Env[0].Name != "DB_HOST" || apiContainer.Env[0].Value != "postgres" {
+		t.Fatalf("unexpected api env: %#v", apiContainer.Env)
+	}
+}
+
+func TestParseTopologyValidatesTypingAndCollisions(t *testing.T) {
+	t.Run("valid nested topology", func(t *testing.T) {
+		req := SandboxRequest{
+			ScanID: "scan-1",
+			Topology: &SandboxTopology{Deployments: []TopologyWorkload{{
+				Name:  "postgres",
+				Image: "postgres:16",
+				Env: map[string]string{
+					"POSTGRES_DB": "app",
+				},
+				Ports: []TopologyPort{{Port: 5432}},
+			}}},
+		}
+		topology, err := req.parseTopology()
+		if err != nil {
+			t.Fatalf("parseTopology returned error: %v", err)
+		}
+		if len(topology.workloads()) != 1 {
+			t.Fatalf("unexpected workload count: %d", len(topology.workloads()))
+		}
+	})
+
+	t.Run("protobuf port number", func(t *testing.T) {
+		req := SandboxRequest{TopologyJSON: `{"containers":[{"name":"api","image":"api:latest","ports":[{"number":8080,"protocol":"tcp"}]}]}`}
+		topology, err := req.parseTopology()
+		if err != nil {
+			t.Fatalf("parseTopology returned error: %v", err)
+		}
+		port := topology.workloads()[0].Ports[0]
+		if port.servicePort() != 8080 || port.containerPort() != 8080 {
+			t.Fatalf("unexpected parsed port: %#v", port)
+		}
+	})
+
+	t.Run("invalid env type", func(t *testing.T) {
+		req := SandboxRequest{TopologyJSON: `{"services":[{"name":"api","image":"api:latest","env":42}]}`}
+		if _, err := req.parseTopology(); err == nil || !strings.Contains(err.Error(), "env must be an object") {
+			t.Fatalf("expected env typing error, got %v", err)
+		}
+	})
+
+	t.Run("name collision", func(t *testing.T) {
+		req := SandboxRequest{TopologyJSON: `{"services":[{"name":"api.v1","image":"api:1"},{"name":"api v1","image":"api:2"}]}`}
+		if _, err := req.parseTopology(); err == nil || !strings.Contains(err.Error(), "collides") {
+			t.Fatalf("expected collision error, got %v", err)
+		}
+	})
+}
+
 func TestCreateSandboxDoesNotReadNamespaces(t *testing.T) {
 	ctx := context.Background()
 	namespace := "aegis-war-room-scan-1"
@@ -203,6 +352,10 @@ func TestCreateSandboxDoesNotReadNamespaces(t *testing.T) {
 			t.Fatalf("CreateSandbox performed a forbidden namespace read")
 		}
 	}
+}
+
+func int32Ptr(value int32) *int32 {
+	return &value
 }
 
 func TestWaitForPodReadyReturnsReadAndTimeoutErrors(t *testing.T) {
