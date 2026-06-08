@@ -170,6 +170,41 @@ func TestCreateSandboxAllowsExistingResources(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxDoesNotReadNamespaces(t *testing.T) {
+	ctx := context.Background()
+	namespace := "aegis-war-room-scan-1"
+	k8s := fake.NewSimpleClientset()
+	k8s.PrependReactor("get", "namespaces", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("namespace read should not be required")
+	})
+	k8s.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction := action.(k8stesting.GetAction)
+		if getAction.GetName() != "target-scan-1" {
+			return false, nil, nil
+		}
+		return true, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "target-scan-1", Namespace: namespace},
+			Status: corev1.PodStatus{
+				Conditions: []corev1.PodCondition{{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionTrue,
+				}},
+			},
+		}, nil
+	})
+	activities := NewActivities(k8s)
+
+	if _, err := activities.CreateSandbox(ctx, SandboxRequest{ScanID: "scan-1", TargetImage: "nginx:latest"}); err != nil {
+		t.Fatalf("CreateSandbox should not require namespace reads: %v", err)
+	}
+
+	for _, action := range k8s.Actions() {
+		if action.GetVerb() == "get" && action.GetResource().Resource == "namespaces" {
+			t.Fatalf("CreateSandbox performed a forbidden namespace read")
+		}
+	}
+}
+
 func TestWaitForPodReadyReturnsReadAndTimeoutErrors(t *testing.T) {
 	t.Run("read error", func(t *testing.T) {
 		k8s := fake.NewSimpleClientset()
