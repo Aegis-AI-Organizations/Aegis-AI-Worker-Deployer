@@ -215,7 +215,7 @@ func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (San
 		return SandboxResponse{}, err
 	}
 	if req.TargetImage == "" && topology == nil {
-		return SandboxResponse{}, errors.New("target_image is required")
+		return SandboxResponse{}, errors.New("target_image or topology_json is required")
 	}
 
 	namespace := sandboxNamespace(req.ScanID)
