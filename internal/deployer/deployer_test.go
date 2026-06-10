@@ -354,10 +354,6 @@ func TestCreateSandboxDoesNotReadNamespaces(t *testing.T) {
 	}
 }
 
-func int32Ptr(value int32) *int32 {
-	return &value
-}
-
 func TestWaitForPodReadyReturnsReadAndTimeoutErrors(t *testing.T) {
 	t.Run("read error", func(t *testing.T) {
 		k8s := fake.NewSimpleClientset()
