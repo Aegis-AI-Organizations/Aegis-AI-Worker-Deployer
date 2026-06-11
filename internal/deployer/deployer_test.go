@@ -270,6 +270,108 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
+	ctx := context.Background()
+	namespace := "aegis-war-room-scan-1"
+	k8s := fake.NewSimpleClientset()
+	createdDeployments := map[string]*appsv1.Deployment{}
+	k8s.PrependReactor("create", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		deployment := createAction.GetObject().(*appsv1.Deployment)
+		createdDeployments[deployment.Name] = deployment
+		return true, deployment, nil
+	})
+	k8s.PrependReactor("create", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		service := createAction.GetObject().(*corev1.Service)
+		return true, service, nil
+	})
+	k8s.PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction := action.(k8stesting.GetAction)
+		name := getAction.GetName()
+		deployment := createdDeployments[name]
+		if deployment == nil {
+			return false, nil, nil
+		}
+		readyDeployment := deployment.DeepCopy()
+		readyDeployment.Namespace = namespace
+		readyDeployment.Generation = 1
+		readyDeployment.Status = appsv1.DeploymentStatus{
+			ObservedGeneration: 1,
+			UpdatedReplicas:    *deployment.Spec.Replicas,
+			AvailableReplicas:  *deployment.Spec.Replicas,
+		}
+		return true, readyDeployment, nil
+	})
+
+	activities := NewActivities(k8s)
+	response, err := activities.CreateSandbox(ctx, SandboxRequest{
+		ScanID: "scan-1",
+		TopologyJSON: `{
+			"deployments": [
+				{
+					"name": "api",
+					"image": "node:20",
+					"env": {"DB_PASS": "REDACTED", "NODE_ENV": "production"},
+					"ports": [{"port": 3000}]
+				},
+				{
+					"name": "postgres",
+					"image": "postgres:16",
+					"env_vars": [{"name": "POSTGRES_PASSWORD", "value": "REDACTED"}],
+					"ports": [{"port": 5432}]
+				}
+			]
+		}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox returned error: %v", err)
+	}
+	if response.Namespace != namespace {
+		t.Fatalf("unexpected namespace: %s", response.Namespace)
+	}
+
+	apiDeployment := createdDeployments["api"]
+	if apiDeployment == nil {
+		t.Fatalf("api deployment was not created")
+	}
+	var apiPassword string
+	for _, env := range apiDeployment.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == "DB_PASS" {
+			apiPassword = env.Value
+		}
+		if env.Value == "REDACTED" {
+			t.Fatalf("api deployment still contains REDACTED: %#v", apiDeployment.Spec.Template.Spec.Containers[0].Env)
+		}
+	}
+	if apiPassword == "" {
+		t.Fatalf("api deployment is missing DB_PASS env")
+	}
+
+	postgresDeployment := createdDeployments["postgres"]
+	if postgresDeployment == nil {
+		t.Fatalf("postgres deployment was not created")
+	}
+	var postgresPassword string
+	for _, env := range postgresDeployment.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == "POSTGRES_PASSWORD" {
+			postgresPassword = env.Value
+		}
+		if env.Value == "REDACTED" {
+			t.Fatalf("postgres deployment still contains REDACTED: %#v", postgresDeployment.Spec.Template.Spec.Containers[0].Env)
+		}
+	}
+	if postgresPassword == "" {
+		t.Fatalf("postgres deployment is missing POSTGRES_PASSWORD env")
+	}
+	if apiPassword != postgresPassword {
+		t.Fatalf("expected shared mock secret, got api=%q postgres=%q", apiPassword, postgresPassword)
+	}
+	if !strings.HasPrefix(apiPassword, topologyMockSecretPrefix) {
+		t.Fatalf("unexpected mock secret format: %q", apiPassword)
+	}
+}
+
 func TestParseTopologyValidatesTypingAndCollisions(t *testing.T) {
 	t.Run("valid nested topology", func(t *testing.T) {
 		req := SandboxRequest{

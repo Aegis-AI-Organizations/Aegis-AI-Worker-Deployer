@@ -34,6 +34,7 @@ const (
 	defaultTemporalNamespace = "default"
 	defaultTaskQueue         = "DEPLOYER_TASK_QUEUE"
 	sandboxNamespacePrefix   = "aegis-war-room-"
+	topologyMockSecretPrefix = "aegis-mock-secret"
 )
 
 var (
@@ -442,8 +443,10 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 	workloads := topology.workloads()
 	log.Printf("[CreateSandbox] scan=%s deploying topology with %d workload(s)", scanID, len(workloads))
 
+	mockSecret := mockTopologySecret(scanID)
 	firstServiceName := ""
 	for index, workload := range workloads {
+		workload = sanitizeTopologySecrets(workload, mockSecret)
 		name := kubernetesName(workload.Name)
 		if firstServiceName == "" {
 			firstServiceName = name
@@ -478,6 +481,37 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 	}
 	log.Printf("[CreateSandbox] scan=%s topology sandbox ready endpoint=%s", scanID, endpoint)
 	return SandboxResponse{Namespace: namespace, Endpoint: endpoint}, nil
+}
+
+func mockTopologySecret(scanID string) string {
+	scanID = strings.TrimSpace(scanID)
+	if scanID == "" {
+		return topologyMockSecretPrefix
+	}
+	return fmt.Sprintf("%s-%s", topologyMockSecretPrefix, scanID)
+}
+
+func sanitizeTopologySecrets(workload TopologyWorkload, secret string) TopologyWorkload {
+	if len(workload.Env) == 0 {
+		return workload
+	}
+
+	sanitized := make(map[string]string, len(workload.Env))
+	for key, value := range workload.Env {
+		sanitized[strings.TrimSpace(key)] = replaceRedactedSecret(value, secret)
+	}
+	workload.Env = sanitized
+	return workload
+}
+
+func replaceRedactedSecret(value, secret string) string {
+	if secret == "" {
+		secret = topologyMockSecretPrefix
+	}
+	if strings.EqualFold(strings.TrimSpace(value), "REDACTED") {
+		return secret
+	}
+	return value
 }
 
 func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, name string, workload TopologyWorkload) error {
