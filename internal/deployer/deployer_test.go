@@ -270,6 +270,75 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxContinuesWhenTopologyWorkloadIsNotReady(t *testing.T) {
+	ctx := context.Background()
+	namespace := "aegis-war-room-scan-1"
+	k8s := fake.NewSimpleClientset()
+	createdDeployments := map[string]*appsv1.Deployment{}
+	createdServices := map[string]*corev1.Service{}
+	origReadyTimeout := topologyDeploymentReadyTimeout
+	topologyDeploymentReadyTimeout = time.Millisecond
+	defer func() { topologyDeploymentReadyTimeout = origReadyTimeout }()
+
+	k8s.PrependReactor("create", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		deployment := createAction.GetObject().(*appsv1.Deployment)
+		createdDeployments[deployment.Name] = deployment
+		return true, deployment, nil
+	})
+	k8s.PrependReactor("create", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		service := createAction.GetObject().(*corev1.Service)
+		createdServices[service.Name] = service
+		return true, service, nil
+	})
+	k8s.PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction := action.(k8stesting.GetAction)
+		name := getAction.GetName()
+		deployment := createdDeployments[name]
+		if deployment == nil {
+			return false, nil, nil
+		}
+
+		status := appsv1.DeploymentStatus{
+			ObservedGeneration: 1,
+			UpdatedReplicas:    *deployment.Spec.Replicas,
+		}
+		if name == "ready-api" {
+			status.AvailableReplicas = *deployment.Spec.Replicas
+		}
+
+		deploymentCopy := deployment.DeepCopy()
+		deploymentCopy.Namespace = namespace
+		deploymentCopy.Generation = 1
+		deploymentCopy.Status = status
+		return true, deploymentCopy, nil
+	})
+
+	activities := NewActivities(k8s)
+	response, err := activities.CreateSandbox(ctx, SandboxRequest{
+		ScanID: "scan-1",
+		TopologyJSON: `{
+			"services": [
+				{"name": "broken app", "image": "broken:latest", "ports": [{"port": 8080}]},
+				{"name": "ready api", "image": "nginx:1.27", "ports": [{"port": 9090}]}
+			]
+		}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox should continue past an unready workload: %v", err)
+	}
+	if response.Endpoint != "http://ready-api.aegis-war-room-scan-1.svc.cluster.local:9090" {
+		t.Fatalf("unexpected endpoint: %s", response.Endpoint)
+	}
+	if createdDeployments["broken-app"] == nil || createdDeployments["ready-api"] == nil {
+		t.Fatalf("expected both deployments to be created: %#v", createdDeployments)
+	}
+	if createdServices["broken-app"] == nil || createdServices["ready-api"] == nil {
+		t.Fatalf("expected both services to be created: %#v", createdServices)
+	}
+}
+
 func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 	ctx := context.Background()
 	namespace := "aegis-war-room-scan-1"

@@ -39,11 +39,12 @@ const (
 )
 
 var (
-	newK8sClient               = newKubernetesClient
-	temporalDial               = client.Dial
-	newWorker                  = worker.New
-	temporalConnectMaxAttempts = 0
-	temporalConnectRetryDelay  = 2 * time.Second
+	newK8sClient                   = newKubernetesClient
+	temporalDial                   = client.Dial
+	newWorker                      = worker.New
+	temporalConnectMaxAttempts     = 0
+	temporalConnectRetryDelay      = 2 * time.Second
+	topologyDeploymentReadyTimeout = 15 * time.Second
 )
 
 type SandboxRequest struct {
@@ -446,9 +447,15 @@ func (a *Activities) createNamespace(ctx context.Context, namespace, scanID stri
 func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespace string, topology *SandboxTopology) (SandboxResponse, error) {
 	workloads := topology.workloads()
 	log.Printf("[CreateSandbox] scan=%s deploying topology with %d workload(s)", scanID, len(workloads))
+	if len(workloads) == 0 {
+		return SandboxResponse{}, errors.New("topology does not contain any workload")
+	}
 
 	mockSecret := mockTopologySecret(scanID)
 	firstServiceName := ""
+	firstReadyServiceName := ""
+	firstReadyServicePort := int32(0)
+	createdWorkloads := make([]TopologyWorkload, 0, len(workloads))
 	for index, workload := range workloads {
 		workload = sanitizeTopologySecrets(workload, mockSecret)
 		name := kubernetesName(workload.Name)
@@ -474,14 +481,36 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 				return SandboxResponse{}, err
 			}
 		}
-		if err := a.waitForDeploymentReady(ctx, namespace, name, time.Minute); err != nil {
-			return SandboxResponse{}, err
+		createdWorkloads = append(createdWorkloads, workload)
+	}
+
+	for _, workload := range createdWorkloads {
+		name := kubernetesName(workload.Name)
+		ports := workload.normalizedPorts()
+		if err := a.waitForDeploymentReady(ctx, namespace, name, topologyDeploymentReadyTimeout); err != nil {
+			log.Printf("[CreateSandbox] deployment %s/%s is not ready; continuing topology deployment: %v", namespace, name, err)
+			continue
+		}
+		if firstReadyServiceName == "" && len(ports) > 0 {
+			firstReadyServiceName = name
+			firstReadyServicePort = ports[0].servicePort()
 		}
 	}
 
-	endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local", firstServiceName, namespace)
-	if len(workloads[0].normalizedPorts()) > 0 {
-		endpoint = fmt.Sprintf("%s:%d", endpoint, workloads[0].normalizedPorts()[0].servicePort())
+	endpointServiceName := firstReadyServiceName
+	endpointPort := firstReadyServicePort
+	if endpointServiceName == "" {
+		endpointServiceName = firstServiceName
+		firstWorkloadPorts := workloads[0].normalizedPorts()
+		if len(firstWorkloadPorts) > 0 {
+			endpointPort = firstWorkloadPorts[0].servicePort()
+		}
+		log.Printf("[CreateSandbox] scan=%s topology has no ready service; falling back to first declared endpoint", scanID)
+	}
+
+	endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local", endpointServiceName, namespace)
+	if endpointPort > 0 {
+		endpoint = fmt.Sprintf("%s:%d", endpoint, endpointPort)
 	}
 	log.Printf("[CreateSandbox] scan=%s topology sandbox ready endpoint=%s", scanID, endpoint)
 	return SandboxResponse{Namespace: namespace, Endpoint: endpoint}, nil
