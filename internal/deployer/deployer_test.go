@@ -727,6 +727,7 @@ func TestRun_TemporalConnectionFailureAndSuccess(t *testing.T) {
 	})
 
 	t.Run("succeeds after retrying", func(t *testing.T) {
+		t.Setenv("TEMPORAL_WORKER_STOP_TIMEOUT_SECONDS", "123")
 		temporalConnectMaxAttempts = 5
 		dialCount := 0
 		temporalDial = func(options client.Options) (client.Client, error) {
@@ -740,6 +741,9 @@ func TestRun_TemporalConnectionFailureAndSuccess(t *testing.T) {
 		workerCreated := false
 		newWorker = func(c client.Client, taskQueue string, options worker.Options) worker.Worker {
 			workerCreated = true
+			if options.WorkerStopTimeout != 123*time.Second {
+				t.Fatalf("expected worker stop timeout 123s, got %s", options.WorkerStopTimeout)
+			}
 			return &testMockWorker{}
 		}
 

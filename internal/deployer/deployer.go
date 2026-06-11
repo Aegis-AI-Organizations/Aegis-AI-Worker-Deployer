@@ -10,6 +10,7 @@ import (
 	"hash/fnv"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -145,7 +146,10 @@ func Run(ctx context.Context) error {
 	}
 	defer temporalClient.Close()
 
-	w := newWorker(temporalClient, getenv("DEPLOYER_TASK_QUEUE", defaultTaskQueue), worker.Options{})
+	stopTimeout := envDurationSeconds("TEMPORAL_WORKER_STOP_TIMEOUT_SECONDS", 14*time.Minute)
+	w := newWorker(temporalClient, getenv("DEPLOYER_TASK_QUEUE", defaultTaskQueue), worker.Options{
+		WorkerStopTimeout: stopTimeout,
+	})
 	activities := NewActivities(k8s)
 	w.RegisterActivityWithOptions(activities.CreateSandbox, activity.RegisterOptions{Name: "CreateSandbox"})
 	w.RegisterActivityWithOptions(activities.DestroySandbox, activity.RegisterOptions{Name: "DestroySandbox"})
@@ -940,4 +944,17 @@ func envBool(key string) bool {
 	default:
 		return false
 	}
+}
+
+func envDurationSeconds(key string, fallback time.Duration) time.Duration {
+	value := getenv(key, "")
+	if value == "" {
+		return fallback
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds <= 0 {
+		log.Printf("Invalid %s=%q, using %s", key, value, fallback)
+		return fallback
+	}
+	return time.Duration(seconds) * time.Second
 }
