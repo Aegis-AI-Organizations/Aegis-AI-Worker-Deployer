@@ -245,6 +245,12 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	if webContainer.Image != "nginx:1.27" {
 		t.Fatalf("unexpected web image: %s", webContainer.Image)
 	}
+	if webContainer.ReadinessProbe == nil || webContainer.ReadinessProbe.TCPSocket == nil {
+		t.Fatalf("expected readiness probe on web deployment: %#v", webContainer.ReadinessProbe)
+	}
+	if webContainer.ReadinessProbe.TCPSocket.Port.IntVal != 8080 {
+		t.Fatalf("unexpected readiness probe port: %#v", webContainer.ReadinessProbe.TCPSocket.Port)
+	}
 	if len(webContainer.Env) != 1 || webContainer.Env[0].Name != "API_URL" || webContainer.Env[0].Value != "http://api:8080" {
 		t.Fatalf("unexpected web env: %#v", webContainer.Env)
 	}
@@ -267,6 +273,125 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	apiContainer := apiDeployment.Spec.Template.Spec.Containers[0]
 	if len(apiContainer.Env) != 1 || apiContainer.Env[0].Name != "DB_HOST" || apiContainer.Env[0].Value != "postgres" {
 		t.Fatalf("unexpected api env: %#v", apiContainer.Env)
+	}
+}
+
+func TestCreateSandboxHonorsPreferredTopologyEndpoint(t *testing.T) {
+	ctx := context.Background()
+	namespace := "aegis-war-room-scan-1"
+	k8s := fake.NewSimpleClientset()
+	createdDeployments := map[string]*appsv1.Deployment{}
+	k8s.PrependReactor("create", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		deployment := createAction.GetObject().(*appsv1.Deployment)
+		createdDeployments[deployment.Name] = deployment
+		return true, deployment, nil
+	})
+	k8s.PrependReactor("create", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		service := createAction.GetObject().(*corev1.Service)
+		return true, service, nil
+	})
+	k8s.PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction := action.(k8stesting.GetAction)
+		name := getAction.GetName()
+		deployment := createdDeployments[name]
+		if deployment == nil {
+			return false, nil, nil
+		}
+		readyDeployment := deployment.DeepCopy()
+		readyDeployment.Namespace = namespace
+		readyDeployment.Generation = 1
+		readyDeployment.Status = appsv1.DeploymentStatus{
+			ObservedGeneration: 1,
+			UpdatedReplicas:    *deployment.Spec.Replicas,
+			AvailableReplicas:  *deployment.Spec.Replicas,
+		}
+		return true, readyDeployment, nil
+	})
+
+	activities := NewActivities(k8s)
+	response, err := activities.CreateSandbox(ctx, SandboxRequest{
+		ScanID:                    "scan-1",
+		PreferredEndpointWorkload: "api",
+		TopologyJSON: `{
+			"services": [
+				{
+					"name": "web frontend",
+					"image": "nginx:1.27",
+					"ports": [{"port": 80, "container_port": 8080}]
+				},
+				{
+					"name": "api",
+					"image": "ghcr.io/aegis/api:anon",
+					"ports": [{"port": 8080}]
+				}
+			]
+		}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox returned error: %v", err)
+	}
+	if response.EndpointWorkload != "api" {
+		t.Fatalf("unexpected endpoint workload: %s", response.EndpointWorkload)
+	}
+	if response.Endpoint != "http://api.aegis-war-room-scan-1.svc.cluster.local:8080" {
+		t.Fatalf("unexpected endpoint: %s", response.Endpoint)
+	}
+}
+
+func TestCreateSandboxFailsWhenPreferredTopologyEndpointIsNotReady(t *testing.T) {
+	ctx := context.Background()
+	namespace := "aegis-war-room-scan-1"
+	k8s := fake.NewSimpleClientset()
+	createdDeployments := map[string]*appsv1.Deployment{}
+	k8s.PrependReactor("create", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		deployment := createAction.GetObject().(*appsv1.Deployment)
+		createdDeployments[deployment.Name] = deployment
+		return true, deployment, nil
+	})
+	k8s.PrependReactor("create", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		service := createAction.GetObject().(*corev1.Service)
+		return true, service, nil
+	})
+	k8s.PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction := action.(k8stesting.GetAction)
+		name := getAction.GetName()
+		deployment := createdDeployments[name]
+		if deployment == nil {
+			return false, nil, nil
+		}
+
+		status := appsv1.DeploymentStatus{
+			ObservedGeneration: 1,
+			UpdatedReplicas:    *deployment.Spec.Replicas,
+		}
+		if name == "ready-api" {
+			status.AvailableReplicas = *deployment.Spec.Replicas
+		}
+
+		deploymentCopy := deployment.DeepCopy()
+		deploymentCopy.Namespace = namespace
+		deploymentCopy.Generation = 1
+		deploymentCopy.Status = status
+		return true, deploymentCopy, nil
+	})
+
+	activities := NewActivities(k8s)
+	_, err := activities.CreateSandbox(ctx, SandboxRequest{
+		ScanID:                    "scan-1",
+		PreferredEndpointWorkload: "broken-app",
+		TopologyJSON: `{
+			"services": [
+				{"name": "broken app", "image": "broken:latest", "ports": [{"port": 8080}]},
+				{"name": "ready api", "image": "nginx:1.27", "ports": [{"port": 9090}]}
+			]
+		}`,
+	})
+	if err == nil || !strings.Contains(err.Error(), "preferred endpoint workload") {
+		t.Fatalf("expected preferred endpoint failure, got %v", err)
 	}
 }
 

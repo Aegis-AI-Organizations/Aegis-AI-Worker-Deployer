@@ -48,10 +48,11 @@ var (
 )
 
 type SandboxRequest struct {
-	ScanID       string           `json:"scan_id"`
-	TargetImage  string           `json:"target_image"`
-	Topology     *SandboxTopology `json:"topology,omitempty"`
-	TopologyJSON string           `json:"topology_json,omitempty"`
+	ScanID                    string           `json:"scan_id"`
+	TargetImage               string           `json:"target_image"`
+	Topology                  *SandboxTopology `json:"topology,omitempty"`
+	TopologyJSON              string           `json:"topology_json,omitempty"`
+	PreferredEndpointWorkload string           `json:"preferred_endpoint_workload,omitempty"`
 }
 
 type SandboxResponse struct {
@@ -269,7 +270,7 @@ func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (San
 	log.Printf("[CreateSandbox] scan=%s namespace %s ready", req.ScanID, namespace)
 
 	if topology != nil {
-		return a.createTopologySandbox(ctx, req.ScanID, namespace, topology)
+		return a.createTopologySandbox(ctx, req.ScanID, namespace, topology, req.PreferredEndpointWorkload)
 	}
 
 	log.Printf("[CreateSandbox] scan=%s creating pod %s/%s", req.ScanID, namespace, podName)
@@ -465,13 +466,17 @@ func (a *Activities) createNamespace(ctx context.Context, namespace, scanID stri
 	return nil
 }
 
-func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespace string, topology *SandboxTopology) (SandboxResponse, error) {
+func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespace string, topology *SandboxTopology, preferredEndpointWorkload string) (SandboxResponse, error) {
 	workloads := topology.workloads()
 	log.Printf("[CreateSandbox] scan=%s deploying topology with %d workload(s)", scanID, len(workloads))
 	if len(workloads) == 0 {
 		return SandboxResponse{}, errors.New("topology does not contain any workload")
 	}
 
+	preferredEndpointWorkload = strings.TrimSpace(strings.ToLower(preferredEndpointWorkload))
+	if preferredEndpointWorkload != "" {
+		preferredEndpointWorkload = kubernetesName(preferredEndpointWorkload)
+	}
 	mockSecret := mockTopologySecret(scanID)
 	firstServiceName := ""
 	firstReadyServiceName := ""
@@ -556,6 +561,38 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 
 	endpointServiceName := firstReadyServiceName
 	endpointPort := firstReadyServicePort
+	if preferredEndpointWorkload != "" {
+		preferredStatus, ok := findWorkloadStatus(statuses, preferredEndpointWorkload)
+		if !ok {
+			return SandboxResponse{
+				Namespace: namespace,
+				Workloads: statuses,
+				Summary:   summarizeSandboxWorkloads(len(workloads), statuses, false),
+			}, fmt.Errorf("preferred endpoint workload %q was not deployed", preferredEndpointWorkload)
+		}
+		if preferredStatus.Status != "ready" {
+			return SandboxResponse{
+					Namespace: namespace,
+					Workloads: statuses,
+					Summary:   summarizeSandboxWorkloads(len(workloads), statuses, false),
+				}, fmt.Errorf(
+					"preferred endpoint workload %q is %s: %s",
+					preferredEndpointWorkload,
+					preferredStatus.Status,
+					strings.TrimSpace(preferredStatus.Error),
+				)
+		}
+		preferredPorts := topologyPortsForWorkload(createdWorkloads, preferredEndpointWorkload)
+		if len(preferredPorts) == 0 {
+			return SandboxResponse{
+				Namespace: namespace,
+				Workloads: statuses,
+				Summary:   summarizeSandboxWorkloads(len(workloads), statuses, false),
+			}, fmt.Errorf("preferred endpoint workload %q does not expose any port", preferredEndpointWorkload)
+		}
+		endpointServiceName = preferredEndpointWorkload
+		endpointPort = preferredPorts[0].servicePort()
+	}
 	if endpointServiceName == "" {
 		endpointServiceName = firstServiceName
 		firstWorkloadPorts := workloads[0].normalizedPorts()
@@ -644,6 +681,21 @@ func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, na
 	if workload.Replicas != nil && *workload.Replicas > 0 {
 		replicas = *workload.Replicas
 	}
+	containerPorts := workload.containerPorts()
+	var readinessProbe *corev1.Probe
+	if len(containerPorts) > 0 {
+		readinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{
+					Port: intstr.FromInt32(containerPorts[0].ContainerPort),
+				},
+			},
+			InitialDelaySeconds: 3,
+			PeriodSeconds:       3,
+			TimeoutSeconds:      1,
+			FailureThreshold:    10,
+		}
+	}
 	labels := topologyLabels(scanID, name)
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -664,8 +716,9 @@ func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, na
 						Name:            name,
 						Image:           strings.TrimSpace(workload.Image),
 						ImagePullPolicy: corev1.PullIfNotPresent,
-						Ports:           workload.containerPorts(),
+						Ports:           containerPorts,
 						Env:             workload.envVars(),
+						ReadinessProbe:  readinessProbe,
 					}},
 				},
 			},
@@ -742,6 +795,24 @@ func updateWorkloadStatus(statuses []SandboxWorkloadStatus, name, status, endpoi
 		}
 		return
 	}
+}
+
+func findWorkloadStatus(statuses []SandboxWorkloadStatus, name string) (SandboxWorkloadStatus, bool) {
+	for _, status := range statuses {
+		if status.Name == name {
+			return status, true
+		}
+	}
+	return SandboxWorkloadStatus{}, false
+}
+
+func topologyPortsForWorkload(workloads []TopologyWorkload, name string) []TopologyPort {
+	for _, workload := range workloads {
+		if kubernetesName(workload.Name) == name {
+			return workload.normalizedPorts()
+		}
+	}
+	return nil
 }
 
 func summarizeSandboxWorkloads(requested int, statuses []SandboxWorkloadStatus, endpointSelected bool) SandboxDeploymentSummary {
