@@ -55,8 +55,29 @@ type SandboxRequest struct {
 }
 
 type SandboxResponse struct {
-	Namespace string `json:"namespace"`
-	Endpoint  string `json:"endpoint"`
+	Namespace        string                   `json:"namespace"`
+	Endpoint         string                   `json:"endpoint"`
+	EndpointWorkload string                   `json:"endpoint_workload,omitempty"`
+	Workloads        []SandboxWorkloadStatus  `json:"workloads,omitempty"`
+	Summary          SandboxDeploymentSummary `json:"summary,omitempty"`
+}
+
+type SandboxWorkloadStatus struct {
+	Name     string `json:"name"`
+	Image    string `json:"image"`
+	Service  string `json:"service,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"`
+	Status   string `json:"status"`
+	Error    string `json:"error,omitempty"`
+}
+
+type SandboxDeploymentSummary struct {
+	Requested        int  `json:"requested"`
+	Deployed         int  `json:"deployed"`
+	Ready            int  `json:"ready"`
+	NotReady         int  `json:"not_ready"`
+	Skipped          int  `json:"skipped"`
+	EndpointSelected bool `json:"endpoint_selected"`
 }
 
 type SandboxTopology struct {
@@ -456,6 +477,7 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 	firstReadyServiceName := ""
 	firstReadyServicePort := int32(0)
 	createdWorkloads := make([]TopologyWorkload, 0, len(workloads))
+	statuses := make([]SandboxWorkloadStatus, 0, len(workloads))
 	for index, workload := range workloads {
 		workload = sanitizeTopologySecrets(workload, mockSecret)
 		name := kubernetesName(workload.Name)
@@ -474,14 +496,46 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 			len(workload.Env),
 		)
 		if err := a.createDeployment(ctx, namespace, scanID, name, workload); err != nil {
-			return SandboxResponse{}, err
+			log.Printf("[CreateSandbox] deployment %s/%s failed; continuing topology deployment: %v", namespace, name, err)
+			statuses = append(statuses, SandboxWorkloadStatus{
+				Name:   name,
+				Image:  workload.Image,
+				Status: "skipped",
+				Error:  err.Error(),
+			})
+			continue
 		}
 		if len(workload.normalizedPorts()) > 0 {
 			if err := a.createTopologyService(ctx, namespace, scanID, name, workload); err != nil {
-				return SandboxResponse{}, err
+				log.Printf("[CreateSandbox] service %s/%s failed; workload remains deployed without service: %v", namespace, name, err)
+				statuses = append(statuses, SandboxWorkloadStatus{
+					Name:   name,
+					Image:  workload.Image,
+					Status: "deployed",
+					Error:  err.Error(),
+				})
+				createdWorkloads = append(createdWorkloads, workload)
+				continue
 			}
 		}
+		statuses = append(statuses, SandboxWorkloadStatus{
+			Name:    name,
+			Image:   workload.Image,
+			Service: serviceNameForWorkload(name, workload),
+			Status:  "deployed",
+		})
 		createdWorkloads = append(createdWorkloads, workload)
+	}
+	if len(createdWorkloads) == 0 {
+		return SandboxResponse{
+			Namespace: namespace,
+			Workloads: statuses,
+			Summary: summarizeSandboxWorkloads(
+				len(workloads),
+				statuses,
+				false,
+			),
+		}, errors.New("topology deployment failed for every workload")
 	}
 
 	for _, workload := range createdWorkloads {
@@ -489,8 +543,11 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 		ports := workload.normalizedPorts()
 		if err := a.waitForDeploymentReady(ctx, namespace, name, topologyDeploymentReadyTimeout); err != nil {
 			log.Printf("[CreateSandbox] deployment %s/%s is not ready; continuing topology deployment: %v", namespace, name, err)
+			updateWorkloadStatus(statuses, name, "not_ready", "", err.Error())
 			continue
 		}
+		endpoint := workloadEndpoint(namespace, name, ports)
+		updateWorkloadStatus(statuses, name, "ready", endpoint, "")
 		if firstReadyServiceName == "" && len(ports) > 0 {
 			firstReadyServiceName = name
 			firstReadyServicePort = ports[0].servicePort()
@@ -513,7 +570,13 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 		endpoint = fmt.Sprintf("%s:%d", endpoint, endpointPort)
 	}
 	log.Printf("[CreateSandbox] scan=%s topology sandbox ready endpoint=%s", scanID, endpoint)
-	return SandboxResponse{Namespace: namespace, Endpoint: endpoint}, nil
+	return SandboxResponse{
+		Namespace:        namespace,
+		Endpoint:         endpoint,
+		EndpointWorkload: endpointServiceName,
+		Workloads:        statuses,
+		Summary:          summarizeSandboxWorkloads(len(workloads), statuses, endpointServiceName != ""),
+	}, nil
 }
 
 func mockTopologySecret(scanID string) string {
@@ -531,20 +594,49 @@ func sanitizeTopologySecrets(workload TopologyWorkload, secret string) TopologyW
 
 	sanitized := make(map[string]string, len(workload.Env))
 	for key, value := range workload.Env {
-		sanitized[strings.TrimSpace(key)] = replaceRedactedSecret(value, secret)
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		sanitized[key] = replaceRedactedSecret(key, value, secret)
 	}
 	workload.Env = sanitized
 	return workload
 }
 
-func replaceRedactedSecret(value, secret string) string {
+func replaceRedactedSecret(key, value, secret string) string {
+	trimmedValue := strings.TrimSpace(value)
+	if !strings.EqualFold(trimmedValue, "REDACTED") && !strings.Contains(trimmedValue, "<REDACTED") {
+		return value
+	}
+	return mockValueForEnvKey(key, secret)
+}
+
+func mockValueForEnvKey(key, secret string) string {
 	if secret == "" {
 		secret = topologyMockSecretPrefix
 	}
-	if strings.EqualFold(strings.TrimSpace(value), "REDACTED") {
+	key = strings.ToUpper(strings.TrimSpace(key))
+	switch {
+	case strings.Contains(key, "AWS_ACCESS_KEY_ID") || key == "AWS_KEY":
+		return "AKIA0000000000000000"
+	case strings.Contains(key, "AWS_SECRET_ACCESS_KEY"):
+		return "aegis-mock-aws-secret"
+	case strings.Contains(key, "JWT_SECRET"):
+		return "aegis-mock-jwt-secret"
+	case strings.Contains(key, "API_KEY") || strings.HasSuffix(key, "_KEY"):
+		return "aegis-mock-api-key"
+	case strings.Contains(key, "TOKEN"):
+		return "aegis-mock-token"
+	case strings.Contains(key, "PASS") ||
+		strings.Contains(key, "PASSWORD") ||
+		strings.Contains(key, "PWD") ||
+		strings.Contains(key, "SECRET") ||
+		strings.Contains(key, "PRIVATE_KEY"):
 		return secret
+	default:
+		return "aegis-mock-value"
 	}
-	return value
 }
 
 func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, name string, workload TopologyWorkload) error {
@@ -615,6 +707,63 @@ func (a *Activities) createTopologyService(ctx context.Context, namespace, scanI
 	}
 	log.Printf("[CreateSandbox] service %s/%s created with %d port(s)", namespace, name, len(service.Spec.Ports))
 	return nil
+}
+
+func serviceNameForWorkload(name string, workload TopologyWorkload) string {
+	if len(workload.normalizedPorts()) == 0 {
+		return ""
+	}
+	return name
+}
+
+func workloadEndpoint(namespace, name string, ports []TopologyPort) string {
+	if len(ports) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"http://%s.%s.svc.cluster.local:%d",
+		name,
+		namespace,
+		ports[0].servicePort(),
+	)
+}
+
+func updateWorkloadStatus(statuses []SandboxWorkloadStatus, name, status, endpoint, errText string) {
+	for i := range statuses {
+		if statuses[i].Name != name {
+			continue
+		}
+		statuses[i].Status = status
+		if endpoint != "" {
+			statuses[i].Endpoint = endpoint
+		}
+		if errText != "" {
+			statuses[i].Error = errText
+		}
+		return
+	}
+}
+
+func summarizeSandboxWorkloads(requested int, statuses []SandboxWorkloadStatus, endpointSelected bool) SandboxDeploymentSummary {
+	summary := SandboxDeploymentSummary{
+		Requested:        requested,
+		EndpointSelected: endpointSelected,
+	}
+	for _, status := range statuses {
+		switch status.Status {
+		case "ready":
+			summary.Deployed++
+			summary.Ready++
+		case "not_ready":
+			summary.Deployed++
+			summary.NotReady++
+		case "deployed":
+			summary.Deployed++
+		case "skipped":
+			summary.Skipped++
+		}
+	}
+	return summary
 }
 
 func (a *Activities) createPod(ctx context.Context, namespace, podName, scanID, image string) error {

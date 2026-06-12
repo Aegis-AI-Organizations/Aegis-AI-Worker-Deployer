@@ -381,7 +381,13 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 				{
 					"name": "api",
 					"image": "node:20",
-					"env": {"DB_PASS": "REDACTED", "NODE_ENV": "production"},
+					"env": {
+						"DB_PASS": "REDACTED",
+						"AWS_ACCESS_KEY_ID": "REDACTED",
+						"API_KEY": "REDACTED",
+						"JWT_SECRET": "REDACTED",
+						"NODE_ENV": "production"
+					},
 					"ports": [{"port": 3000}]
 				},
 				{
@@ -405,7 +411,9 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 		t.Fatalf("api deployment was not created")
 	}
 	var apiPassword string
+	apiEnv := map[string]string{}
 	for _, env := range apiDeployment.Spec.Template.Spec.Containers[0].Env {
+		apiEnv[env.Name] = env.Value
 		if env.Name == "DB_PASS" {
 			apiPassword = env.Value
 		}
@@ -438,6 +446,21 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 	}
 	if !strings.HasPrefix(apiPassword, topologyMockSecretPrefix) {
 		t.Fatalf("unexpected mock secret format: %q", apiPassword)
+	}
+	if apiEnv["AWS_ACCESS_KEY_ID"] != "AKIA0000000000000000" {
+		t.Fatalf("unexpected AWS_ACCESS_KEY_ID mock: %#v", apiEnv)
+	}
+	if apiEnv["API_KEY"] != "aegis-mock-api-key" {
+		t.Fatalf("unexpected API_KEY mock: %#v", apiEnv)
+	}
+	if apiEnv["JWT_SECRET"] != "aegis-mock-jwt-secret" {
+		t.Fatalf("unexpected JWT_SECRET mock: %#v", apiEnv)
+	}
+	if response.Summary.Requested != 2 || response.Summary.Ready != 2 || response.Summary.EndpointSelected != true {
+		t.Fatalf("unexpected sandbox summary: %#v", response.Summary)
+	}
+	if len(response.Workloads) != 2 {
+		t.Fatalf("expected workload statuses, got %#v", response.Workloads)
 	}
 }
 
