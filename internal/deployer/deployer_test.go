@@ -32,6 +32,9 @@ func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 		}
 		return true, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "target-scan-1", Namespace: "aegis-war-room-scan-1"},
+			Spec: corev1.PodSpec{
+				RuntimeClassName: ptrString(sandboxRuntimeClassName),
+			},
 			Status: corev1.PodStatus{
 				Conditions: []corev1.PodCondition{{
 					Type:   corev1.PodReady,
@@ -63,8 +66,25 @@ func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 	if _, err := k8s.CoreV1().Pods(response.Namespace).Get(ctx, "target-scan-1", metav1.GetOptions{}); err != nil {
 		t.Fatalf("pod was not created: %v", err)
 	}
+	pod, err := k8s.CoreV1().Pods(response.Namespace).Get(ctx, "target-scan-1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("pod was not readable: %v", err)
+	}
+	if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != sandboxRuntimeClassName {
+		t.Fatalf("expected pod runtimeClassName %q, got %#v", sandboxRuntimeClassName, pod.Spec.RuntimeClassName)
+	}
 	if _, err := k8s.CoreV1().Services(response.Namespace).Get(ctx, "svc-scan-1", metav1.GetOptions{}); err != nil {
 		t.Fatalf("service was not created: %v", err)
+	}
+	policy, err := k8s.NetworkingV1().NetworkPolicies(response.Namespace).Get(ctx, "default-deny-egress", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("network policy was not created: %v", err)
+	}
+	if len(policy.Spec.PolicyTypes) != 1 || policy.Spec.PolicyTypes[0] != "Egress" {
+		t.Fatalf("expected egress-only network policy, got %#v", policy.Spec.PolicyTypes)
+	}
+	if len(policy.Spec.Egress) != 1 || len(policy.Spec.Egress[0].Ports) != 2 {
+		t.Fatalf("expected only DNS egress ports, got %#v", policy.Spec.Egress)
 	}
 }
 
@@ -240,6 +260,9 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	webDeployment := createdDeployments["web-frontend"]
 	if webDeployment == nil {
 		t.Fatalf("web deployment was not created: %v", err)
+	}
+	if webDeployment.Spec.Template.Spec.RuntimeClassName == nil || *webDeployment.Spec.Template.Spec.RuntimeClassName != sandboxRuntimeClassName {
+		t.Fatalf("expected deployment runtimeClassName %q, got %#v", sandboxRuntimeClassName, webDeployment.Spec.Template.Spec.RuntimeClassName)
 	}
 	webContainer := webDeployment.Spec.Template.Spec.Containers[0]
 	if webContainer.Image != "nginx:1.27" {

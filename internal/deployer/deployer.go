@@ -17,6 +17,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -36,6 +37,7 @@ const (
 	defaultTaskQueue         = "DEPLOYER_TASK_QUEUE"
 	sandboxNamespacePrefix   = "aegis-war-room-"
 	topologyMockSecretPrefix = "aegis-mock-secret"
+	sandboxRuntimeClassName  = "gvisor"
 )
 
 var (
@@ -268,6 +270,9 @@ func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (San
 		return SandboxResponse{}, err
 	}
 	log.Printf("[CreateSandbox] scan=%s namespace %s ready", req.ScanID, namespace)
+	if err := a.createSandboxNetworkPolicy(ctx, namespace, req.ScanID); err != nil {
+		return SandboxResponse{}, err
+	}
 
 	if topology != nil {
 		return a.createTopologySandbox(ctx, req.ScanID, namespace, topology, req.PreferredEndpointWorkload)
@@ -463,6 +468,59 @@ func (a *Activities) createNamespace(ctx context.Context, namespace, scanID stri
 		return fmt.Errorf("create namespace %s: %w", namespace, err)
 	}
 	log.Printf("[CreateSandbox] namespace %s created", namespace)
+	return nil
+}
+
+func (a *Activities) createSandboxNetworkPolicy(ctx context.Context, namespace, scanID string) error {
+	policy := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default-deny-egress",
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "aegis-worker-deployer",
+				"aegis-scan":                   scanID,
+			},
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeEgress,
+			},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					To: []networkingv1.NetworkPolicyPeer{
+						{
+							NamespaceSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"kubernetes.io/metadata.name": "kube-system",
+								},
+							},
+						},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{
+							Protocol: ptrProtocol(corev1.ProtocolUDP),
+							Port:     ptrIntOrString(intstr.FromInt32(53)),
+						},
+						{
+							Protocol: ptrProtocol(corev1.ProtocolTCP),
+							Port:     ptrIntOrString(intstr.FromInt32(53)),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := a.k8s.NetworkingV1().NetworkPolicies(namespace).Create(ctx, policy, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		log.Printf("[CreateSandbox] networkpolicy %s/%s already exists", namespace, policy.Name)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("create sandbox egress policy %s/%s: %w", namespace, policy.Name, err)
+	}
+	log.Printf("[CreateSandbox] networkpolicy %s/%s created", namespace, policy.Name)
 	return nil
 }
 
@@ -712,6 +770,7 @@ func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, na
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
+					RuntimeClassName: ptrString(sandboxRuntimeClassName),
 					Containers: []corev1.Container{{
 						Name:            name,
 						Image:           strings.TrimSpace(workload.Image),
@@ -847,6 +906,7 @@ func (a *Activities) createPod(ctx context.Context, namespace, podName, scanID, 
 			},
 		},
 		Spec: corev1.PodSpec{
+			RuntimeClassName: ptrString(sandboxRuntimeClassName),
 			Containers: []corev1.Container{{
 				Name:            "target-container",
 				Image:           image,
@@ -1150,6 +1210,18 @@ func checkImageErrors(pod *corev1.Pod) error {
 
 func temporalNonRetryableError(message string) error {
 	return temporal.NewNonRetryableApplicationError(message, "SandboxDeploymentError", nil)
+}
+
+func ptrString(value string) *string {
+	return &value
+}
+
+func ptrProtocol(value corev1.Protocol) *corev1.Protocol {
+	return &value
+}
+
+func ptrIntOrString(value intstr.IntOrString) *intstr.IntOrString {
+	return &value
 }
 
 func sandboxNamespace(scanID string) string {
