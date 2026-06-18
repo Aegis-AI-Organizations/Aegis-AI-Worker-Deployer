@@ -874,6 +874,7 @@ func (a *Activities) createExternalMockDeployment(ctx context.Context, namespace
 	replicas := int32(1)
 	labels := externalMockLabels(scanID)
 	mode := int32(420)
+	runtimeClassName := a.sandboxRuntimeClassName(ctx)
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   externalMockName,
@@ -885,7 +886,7 @@ func (a *Activities) createExternalMockDeployment(ctx context.Context, namespace
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
-					RuntimeClassName: ptrString(sandboxRuntimeClassName),
+					RuntimeClassName: runtimeClassName,
 					Containers: []corev1.Container{
 						{
 							Name:            "http",
@@ -955,6 +956,17 @@ func (a *Activities) kubeDNSIP(ctx context.Context) string {
 	return fallbackKubeDNSIP
 }
 
+func (a *Activities) sandboxRuntimeClassName(ctx context.Context) *string {
+	if strings.TrimSpace(sandboxRuntimeClassName) == "" {
+		return nil
+	}
+	if _, err := a.k8s.NodeV1().RuntimeClasses().Get(ctx, sandboxRuntimeClassName, metav1.GetOptions{}); err != nil {
+		log.Printf("[CreateSandbox] runtimeclass %q unavailable; using cluster default runtime: %v", sandboxRuntimeClassName, err)
+		return nil
+	}
+	return ptrString(sandboxRuntimeClassName)
+}
+
 func externalMockCorefile(mockIP, kubeDNSIP string) string {
 	return fmt.Sprintf(`cluster.local:53 {
     errors
@@ -998,6 +1010,7 @@ func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, na
 		dnsConfig = sandboxDNSConfig(namespace, mockDNSIP)
 	}
 	labels := topologyLabels(scanID, name)
+	runtimeClassName := a.sandboxRuntimeClassName(ctx)
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   name,
@@ -1013,7 +1026,7 @@ func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, na
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					RuntimeClassName: ptrString(sandboxRuntimeClassName),
+					RuntimeClassName: runtimeClassName,
 					DNSPolicy:        dnsPolicy,
 					DNSConfig:        dnsConfig,
 					Containers: []corev1.Container{{
@@ -1175,6 +1188,7 @@ func summarizeSandboxWorkloads(requested int, statuses []SandboxWorkloadStatus, 
 }
 
 func (a *Activities) createPod(ctx context.Context, namespace, podName, scanID, image string) error {
+	runtimeClassName := a.sandboxRuntimeClassName(ctx)
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: podName,
@@ -1184,7 +1198,7 @@ func (a *Activities) createPod(ctx context.Context, namespace, podName, scanID, 
 			},
 		},
 		Spec: corev1.PodSpec{
-			RuntimeClassName: ptrString(sandboxRuntimeClassName),
+			RuntimeClassName: runtimeClassName,
 			Containers: []corev1.Container{{
 				Name:            "target-container",
 				Image:           image,

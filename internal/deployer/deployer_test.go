@@ -10,6 +10,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	nodev1 "k8s.io/api/node/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -24,7 +25,7 @@ import (
 
 func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 	ctx := context.Background()
-	k8s := fake.NewSimpleClientset()
+	k8s := fake.NewSimpleClientset(fakeSandboxRuntimeClass())
 	k8s.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		getAction := action.(k8stesting.GetAction)
 		if getAction.GetName() != "target-scan-1" {
@@ -85,6 +86,13 @@ func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 	}
 	if len(policy.Spec.Egress) != 2 || len(policy.Spec.Egress[1].Ports) != 2 {
 		t.Fatalf("expected namespace-local egress plus DNS egress ports, got %#v", policy.Spec.Egress)
+	}
+}
+
+func fakeSandboxRuntimeClass() *nodev1.RuntimeClass {
+	return &nodev1.RuntimeClass{
+		ObjectMeta: metav1.ObjectMeta{Name: sandboxRuntimeClassName},
+		Handler:    "runsc",
 	}
 }
 
@@ -194,7 +202,7 @@ func TestCreateSandboxAllowsExistingResources(t *testing.T) {
 func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	ctx := context.Background()
 	namespace := "aegis-war-room-scan-1"
-	k8s := fake.NewSimpleClientset()
+	k8s := fake.NewSimpleClientset(fakeSandboxRuntimeClass())
 	createdDeployments := map[string]*appsv1.Deployment{}
 	createdServices := map[string]*corev1.Service{}
 	k8s.PrependReactor("create", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
@@ -342,6 +350,69 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	apiContainer := apiDeployment.Spec.Template.Spec.Containers[0]
 	if len(apiContainer.Env) != 1 || apiContainer.Env[0].Name != "DB_HOST" || apiContainer.Env[0].Value != "postgres" {
 		t.Fatalf("unexpected api env: %#v", apiContainer.Env)
+	}
+}
+
+func TestCreateSandboxUsesDefaultRuntimeWhenGVisorIsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	namespace := "aegis-war-room-scan-1"
+	k8s := fake.NewSimpleClientset()
+	createdDeployments := map[string]*appsv1.Deployment{}
+	k8s.PrependReactor("create", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		deployment := createAction.GetObject().(*appsv1.Deployment)
+		createdDeployments[deployment.Name] = deployment
+		return true, deployment, nil
+	})
+	k8s.PrependReactor("create", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		service := createAction.GetObject().(*corev1.Service)
+		return true, service, nil
+	})
+	k8s.PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction := action.(k8stesting.GetAction)
+		name := getAction.GetName()
+		deployment := createdDeployments[name]
+		if deployment == nil {
+			return false, nil, nil
+		}
+		readyDeployment := deployment.DeepCopy()
+		readyDeployment.Namespace = namespace
+		readyDeployment.Generation = 1
+		readyDeployment.Status = appsv1.DeploymentStatus{
+			ObservedGeneration: 1,
+			UpdatedReplicas:    *deployment.Spec.Replicas,
+			AvailableReplicas:  *deployment.Spec.Replicas,
+		}
+		return true, readyDeployment, nil
+	})
+
+	activities := NewActivities(k8s)
+	_, err := activities.CreateSandbox(ctx, SandboxRequest{
+		ScanID: "scan-1",
+		TopologyJSON: `{
+			"services": [
+				{"name": "web", "image": "nginx:1.27", "ports": [{"port": 80}]}
+			]
+		}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox returned error: %v", err)
+	}
+
+	webDeployment := createdDeployments["web"]
+	if webDeployment == nil {
+		t.Fatalf("web deployment was not created")
+	}
+	if webDeployment.Spec.Template.Spec.RuntimeClassName != nil {
+		t.Fatalf("expected default runtime when gvisor is unavailable, got %#v", webDeployment.Spec.Template.Spec.RuntimeClassName)
+	}
+	mockDeployment := createdDeployments[externalMockName]
+	if mockDeployment == nil {
+		t.Fatalf("external mock deployment was not created")
+	}
+	if mockDeployment.Spec.Template.Spec.RuntimeClassName != nil {
+		t.Fatalf("expected external mock default runtime when gvisor is unavailable, got %#v", mockDeployment.Spec.Template.Spec.RuntimeClassName)
 	}
 }
 
