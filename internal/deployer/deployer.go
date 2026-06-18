@@ -38,6 +38,7 @@ const (
 	sandboxNamespacePrefix   = "aegis-war-room-"
 	topologyMockSecretPrefix = "aegis-mock-secret"
 	sandboxRuntimeClassName  = "gvisor"
+	sandboxRuntimeClassEnv   = "SANDBOX_RUNTIME_CLASS"
 	externalMockName         = "external-api-mock"
 	externalMockHTTPPort     = int32(8080)
 	externalMockDNSPort      = int32(53)
@@ -957,14 +958,15 @@ func (a *Activities) kubeDNSIP(ctx context.Context) string {
 }
 
 func (a *Activities) sandboxRuntimeClassName(ctx context.Context) *string {
-	if strings.TrimSpace(sandboxRuntimeClassName) == "" {
+	runtimeClassName := strings.TrimSpace(os.Getenv(sandboxRuntimeClassEnv))
+	if runtimeClassName == "" {
 		return nil
 	}
-	if _, err := a.k8s.NodeV1().RuntimeClasses().Get(ctx, sandboxRuntimeClassName, metav1.GetOptions{}); err != nil {
-		log.Printf("[CreateSandbox] runtimeclass %q unavailable; using cluster default runtime: %v", sandboxRuntimeClassName, err)
+	if _, err := a.k8s.NodeV1().RuntimeClasses().Get(ctx, runtimeClassName, metav1.GetOptions{}); err != nil {
+		log.Printf("[CreateSandbox] runtimeclass %q unavailable; using cluster default runtime: %v", runtimeClassName, err)
 		return nil
 	}
-	return ptrString(sandboxRuntimeClassName)
+	return ptrString(runtimeClassName)
 }
 
 func externalMockCorefile(mockIP, kubeDNSIP string) string {

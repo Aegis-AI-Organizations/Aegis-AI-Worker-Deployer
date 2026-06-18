@@ -25,6 +25,7 @@ import (
 
 func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 	ctx := context.Background()
+	t.Setenv(sandboxRuntimeClassEnv, sandboxRuntimeClassName)
 	k8s := fake.NewSimpleClientset(fakeSandboxRuntimeClass())
 	k8s.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		getAction := action.(k8stesting.GetAction)
@@ -202,6 +203,7 @@ func TestCreateSandboxAllowsExistingResources(t *testing.T) {
 func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	ctx := context.Background()
 	namespace := "aegis-war-room-scan-1"
+	t.Setenv(sandboxRuntimeClassEnv, sandboxRuntimeClassName)
 	k8s := fake.NewSimpleClientset(fakeSandboxRuntimeClass())
 	createdDeployments := map[string]*appsv1.Deployment{}
 	createdServices := map[string]*corev1.Service{}
