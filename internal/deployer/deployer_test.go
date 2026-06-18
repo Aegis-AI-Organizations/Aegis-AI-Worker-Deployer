@@ -409,7 +409,7 @@ func TestCreateSandboxHonorsPreferredTopologyEndpoint(t *testing.T) {
 	}
 }
 
-func TestCreateSandboxFailsWhenPreferredTopologyEndpointIsNotReady(t *testing.T) {
+func TestCreateSandboxExposesPreferredTopologyEndpointWhenNotReady(t *testing.T) {
 	ctx := context.Background()
 	namespace := "aegis-war-room-scan-1"
 	k8s := fake.NewSimpleClientset()
@@ -449,7 +449,7 @@ func TestCreateSandboxFailsWhenPreferredTopologyEndpointIsNotReady(t *testing.T)
 	})
 
 	activities := NewActivities(k8s)
-	_, err := activities.CreateSandbox(ctx, SandboxRequest{
+	response, err := activities.CreateSandbox(ctx, SandboxRequest{
 		ScanID:                    "scan-1",
 		PreferredEndpointWorkload: "broken-app",
 		TopologyJSON: `{
@@ -459,8 +459,21 @@ func TestCreateSandboxFailsWhenPreferredTopologyEndpointIsNotReady(t *testing.T)
 			]
 		}`,
 	})
-	if err == nil || !strings.Contains(err.Error(), "preferred endpoint workload") {
-		t.Fatalf("expected preferred endpoint failure, got %v", err)
+	if err != nil {
+		t.Fatalf("CreateSandbox returned error: %v", err)
+	}
+	if response.EndpointWorkload != "broken-app" {
+		t.Fatalf("unexpected endpoint workload: %s", response.EndpointWorkload)
+	}
+	if response.Endpoint != "http://broken-app.aegis-war-room-scan-1.svc.cluster.local:8080" {
+		t.Fatalf("unexpected endpoint: %s", response.Endpoint)
+	}
+	status, ok := findWorkloadStatus(response.Workloads, "broken-app")
+	if !ok {
+		t.Fatalf("missing broken-app status: %#v", response.Workloads)
+	}
+	if status.Status != "not_ready" {
+		t.Fatalf("unexpected broken-app status: %s", status.Status)
 	}
 }
 

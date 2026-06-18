@@ -659,24 +659,12 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 	endpointPort := firstReadyServicePort
 	if preferredEndpointWorkload != "" {
 		preferredStatus, ok := findWorkloadStatus(statuses, preferredEndpointWorkload)
-		if !ok {
+		if !ok || preferredStatus.Status == "skipped" {
 			return SandboxResponse{
 				Namespace: namespace,
 				Workloads: statuses,
 				Summary:   summarizeSandboxWorkloads(len(workloads), statuses, false),
 			}, fmt.Errorf("preferred endpoint workload %q was not deployed", preferredEndpointWorkload)
-		}
-		if preferredStatus.Status != "ready" {
-			return SandboxResponse{
-					Namespace: namespace,
-					Workloads: statuses,
-					Summary:   summarizeSandboxWorkloads(len(workloads), statuses, false),
-				}, fmt.Errorf(
-					"preferred endpoint workload %q is %s: %s",
-					preferredEndpointWorkload,
-					preferredStatus.Status,
-					strings.TrimSpace(preferredStatus.Error),
-				)
 		}
 		preferredPorts := topologyPortsForWorkload(createdWorkloads, preferredEndpointWorkload)
 		if len(preferredPorts) == 0 {
@@ -685,6 +673,15 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 				Workloads: statuses,
 				Summary:   summarizeSandboxWorkloads(len(workloads), statuses, false),
 			}, fmt.Errorf("preferred endpoint workload %q does not expose any port", preferredEndpointWorkload)
+		}
+		if preferredStatus.Status != "ready" {
+			log.Printf(
+				"[CreateSandbox] scan=%s preferred endpoint workload %q is %s; exposing endpoint anyway: %s",
+				scanID,
+				preferredEndpointWorkload,
+				preferredStatus.Status,
+				strings.TrimSpace(preferredStatus.Error),
+			)
 		}
 		endpointServiceName = preferredEndpointWorkload
 		endpointPort = preferredPorts[0].servicePort()
