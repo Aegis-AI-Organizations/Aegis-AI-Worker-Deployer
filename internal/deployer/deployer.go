@@ -39,6 +39,7 @@ const (
 	topologyMockSecretPrefix = "aegis-mock-secret"
 	sandboxRuntimeClassName  = "gvisor"
 	sandboxRuntimeClassEnv   = "SANDBOX_RUNTIME_CLASS"
+	retainSandboxEnv         = "RETAIN_WAR_ROOM_NAMESPACES"
 	externalMockName         = "external-api-mock"
 	externalMockHTTPPort     = int32(8080)
 	externalMockDNSPort      = int32(53)
@@ -321,6 +322,10 @@ func (a *Activities) DestroySandbox(ctx context.Context, scanID string) (string,
 	namespace := sandboxNamespace(scanID)
 	if err := validateSandboxNamespace(namespace); err != nil {
 		return "", err
+	}
+	if keepSandboxNamespaces() {
+		log.Printf("[DestroySandbox] scan=%s retaining namespace %s because %s=true", scanID, namespace, retainSandboxEnv)
+		return "RETAINED", nil
 	}
 
 	log.Printf("[DestroySandbox] scan=%s deleting namespace %s", scanID, namespace)
@@ -726,21 +731,43 @@ func sanitizeTopologySecrets(workload TopologyWorkload, secret string) TopologyW
 	sanitized := make(map[string]string, len(workload.Env))
 	for key, value := range workload.Env {
 		key = strings.TrimSpace(key)
-		if key == "" {
+		if shouldDropTopologyEnv(key) {
 			continue
 		}
-		sanitized[key] = replaceRedactedSecret(key, value, secret)
+		sanitizedValue, keep := replaceRedactedSecret(key, value, secret)
+		if !keep {
+			log.Printf("[CreateSandbox] dropping non-secret redacted env %q from workload %q", key, workload.Name)
+			continue
+		}
+		sanitized[key] = sanitizedValue
 	}
 	workload.Env = sanitized
 	return workload
 }
 
-func replaceRedactedSecret(key, value, secret string) string {
+func replaceRedactedSecret(key, value, secret string) (string, bool) {
 	trimmedValue := strings.TrimSpace(value)
 	if !strings.EqualFold(trimmedValue, "REDACTED") && !strings.Contains(trimmedValue, "<REDACTED") {
-		return value
+		return value, true
 	}
-	return mockValueForEnvKey(key, secret)
+	if !isSecretLikeEnvKey(key) {
+		return "", false
+	}
+	return mockValueForEnvKey(key, secret), true
+}
+
+func isSecretLikeEnvKey(key string) bool {
+	key = strings.ToUpper(strings.TrimSpace(key))
+	return strings.Contains(key, "AWS_ACCESS_KEY_ID") ||
+		strings.Contains(key, "AWS_SECRET_ACCESS_KEY") ||
+		strings.Contains(key, "API_KEY") ||
+		strings.HasSuffix(key, "_KEY") ||
+		strings.Contains(key, "TOKEN") ||
+		strings.Contains(key, "PASS") ||
+		strings.Contains(key, "PASSWORD") ||
+		strings.Contains(key, "PWD") ||
+		strings.Contains(key, "SECRET") ||
+		strings.Contains(key, "PRIVATE_KEY")
 }
 
 func mockValueForEnvKey(key, secret string) string {
@@ -768,6 +795,40 @@ func mockValueForEnvKey(key, secret string) string {
 	default:
 		return "aegis-mock-value"
 	}
+}
+
+func shouldDropTopologyEnv(key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" || !isValidEnvName(key) {
+		return true
+	}
+	upper := strings.ToUpper(key)
+	switch upper {
+	case "PATH", "HOME", "HOSTNAME":
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidEnvName(key string) bool {
+	for i, r := range key {
+		if i == 0 {
+			if r != '_' && !unicode.IsLetter(r) {
+				return false
+			}
+			continue
+		}
+		if r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return key != ""
+}
+
+func keepSandboxNamespaces() bool {
+	enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(retainSandboxEnv)))
+	return err == nil && enabled
 }
 
 func (a *Activities) createExternalDependencyMock(ctx context.Context, namespace, scanID string) (string, error) {
@@ -1412,7 +1473,7 @@ func (w TopologyWorkload) envVars() []corev1.EnvVar {
 	envVars := make([]corev1.EnvVar, 0, len(w.Env))
 	for key, value := range w.Env {
 		key = strings.TrimSpace(key)
-		if key == "" {
+		if shouldDropTopologyEnv(key) {
 			continue
 		}
 		envVars = append(envVars, corev1.EnvVar{Name: key, Value: value})

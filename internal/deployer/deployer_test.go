@@ -666,7 +666,10 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 						"AWS_ACCESS_KEY_ID": "REDACTED",
 						"API_KEY": "REDACTED",
 						"JWT_SECRET": "REDACTED",
-						"NODE_ENV": "production"
+						"NODE_ENV": "production",
+						"PATH": "REDACTED",
+						"PUBLIC_URL": "REDACTED",
+						"label:com.docker.compose.service": "api"
 					},
 					"ports": [{"port": 3000}]
 				},
@@ -735,6 +738,18 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 	}
 	if apiEnv["JWT_SECRET"] != "aegis-mock-jwt-secret" {
 		t.Fatalf("unexpected JWT_SECRET mock: %#v", apiEnv)
+	}
+	if _, ok := apiEnv["PATH"]; ok {
+		t.Fatalf("runtime PATH env should not be injected: %#v", apiEnv)
+	}
+	if _, ok := apiEnv["PUBLIC_URL"]; ok {
+		t.Fatalf("non-secret redacted env should be dropped: %#v", apiEnv)
+	}
+	if _, ok := apiEnv["label:com.docker.compose.service"]; ok {
+		t.Fatalf("label-like env should be dropped: %#v", apiEnv)
+	}
+	if apiEnv["NODE_ENV"] != "production" {
+		t.Fatalf("expected non-redacted env to be preserved: %#v", apiEnv)
 	}
 	if response.Summary.Requested != 2 || response.Summary.Ready != 2 || response.Summary.EndpointSelected != true {
 		t.Fatalf("unexpected sandbox summary: %#v", response.Summary)
@@ -873,6 +888,26 @@ func TestDestroySandboxDeletesNamespace(t *testing.T) {
 	_, err = k8s.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("expected namespace to be deleted, got %v", err)
+	}
+}
+
+func TestDestroySandboxCanRetainNamespaceForDebugging(t *testing.T) {
+	t.Setenv(retainSandboxEnv, "true")
+	ctx := context.Background()
+	namespace := "aegis-war-room-scan-1"
+	k8s := fake.NewSimpleClientset(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})
+	activities := NewActivities(k8s)
+
+	result, err := activities.DestroySandbox(ctx, "scan-1")
+	if err != nil {
+		t.Fatalf("DestroySandbox returned error: %v", err)
+	}
+	if result != "RETAINED" {
+		t.Fatalf("unexpected result: %s", result)
+	}
+
+	if _, err := k8s.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected namespace to be retained, got %v", err)
 	}
 }
 
