@@ -83,8 +83,8 @@ func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 	if len(policy.Spec.PolicyTypes) != 1 || policy.Spec.PolicyTypes[0] != "Egress" {
 		t.Fatalf("expected egress-only network policy, got %#v", policy.Spec.PolicyTypes)
 	}
-	if len(policy.Spec.Egress) != 1 || len(policy.Spec.Egress[0].Ports) != 2 {
-		t.Fatalf("expected only DNS egress ports, got %#v", policy.Spec.Egress)
+	if len(policy.Spec.Egress) != 2 || len(policy.Spec.Egress[1].Ports) != 2 {
+		t.Fatalf("expected namespace-local egress plus DNS egress ports, got %#v", policy.Spec.Egress)
 	}
 }
 
@@ -236,6 +236,13 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 					"name": "web frontend",
 					"image": "nginx:1.27",
 					"env": {"API_URL": "http://api:8080"},
+					"livenessProbe": {
+						"httpGet": {
+							"host": "api.stripe.com",
+							"path": "/health",
+							"port": 443
+						}
+					},
 					"ports": [{"port": 80, "container_port": 8080}]
 				},
 				{
@@ -274,6 +281,21 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	if webContainer.ReadinessProbe.TCPSocket.Port.IntVal != 8080 {
 		t.Fatalf("unexpected readiness probe port: %#v", webContainer.ReadinessProbe.TCPSocket.Port)
 	}
+	if webContainer.LivenessProbe == nil || webContainer.LivenessProbe.TCPSocket == nil {
+		t.Fatalf("expected local TCP liveness probe on web deployment: %#v", webContainer.LivenessProbe)
+	}
+	if webContainer.LivenessProbe.HTTPGet != nil || webContainer.LivenessProbe.Exec != nil {
+		t.Fatalf("expected external liveness probe to be removed: %#v", webContainer.LivenessProbe)
+	}
+	if webContainer.LivenessProbe.TCPSocket.Port.IntVal != 8080 {
+		t.Fatalf("unexpected liveness probe port: %#v", webContainer.LivenessProbe.TCPSocket.Port)
+	}
+	if webDeployment.Spec.Template.Spec.DNSPolicy != corev1.DNSNone {
+		t.Fatalf("expected topology deployment to use mock DNS, got %s", webDeployment.Spec.Template.Spec.DNSPolicy)
+	}
+	if webDeployment.Spec.Template.Spec.DNSConfig == nil || len(webDeployment.Spec.Template.Spec.DNSConfig.Nameservers) != 1 {
+		t.Fatalf("expected mock DNS nameserver: %#v", webDeployment.Spec.Template.Spec.DNSConfig)
+	}
 	if len(webContainer.Env) != 1 || webContainer.Env[0].Name != "API_URL" || webContainer.Env[0].Value != "http://api:8080" {
 		t.Fatalf("unexpected web env: %#v", webContainer.Env)
 	}
@@ -287,6 +309,30 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	}
 	if webService.Spec.Ports[0].Port != 80 || webService.Spec.Ports[0].TargetPort.IntVal != 8080 {
 		t.Fatalf("unexpected web service port: %#v", webService.Spec.Ports[0])
+	}
+	mockService := createdServices[externalMockName]
+	if mockService == nil {
+		t.Fatalf("external dependency mock service was not created")
+	}
+	if len(mockService.Spec.Ports) != 3 {
+		t.Fatalf("unexpected mock service ports: %#v", mockService.Spec.Ports)
+	}
+	mockDeployment := createdDeployments[externalMockName]
+	if mockDeployment == nil {
+		t.Fatalf("external dependency mock deployment was not created")
+	}
+	if len(mockDeployment.Spec.Template.Spec.Containers) != 2 {
+		t.Fatalf("expected HTTP and DNS mock containers: %#v", mockDeployment.Spec.Template.Spec.Containers)
+	}
+	mockConfig, err := k8s.CoreV1().ConfigMaps(namespace).Get(ctx, externalMockName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("external dependency mock configmap was not created: %v", err)
+	}
+	if !strings.Contains(mockConfig.Data["Corefile"], "template IN A .") {
+		t.Fatalf("expected CoreDNS wildcard template, got %q", mockConfig.Data["Corefile"])
+	}
+	if !strings.Contains(mockConfig.Data["default.conf"], "return 200") {
+		t.Fatalf("expected HTTP mock to return 200, got %q", mockConfig.Data["default.conf"])
 	}
 
 	apiDeployment := createdDeployments["api"]
