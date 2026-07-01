@@ -27,6 +27,13 @@ func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv(sandboxRuntimeClassEnv, sandboxRuntimeClassName)
 	k8s := fake.NewSimpleClientset(fakeSandboxRuntimeClass())
+	var createdPod *corev1.Pod
+	k8s.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		pod := createAction.GetObject().(*corev1.Pod)
+		createdPod = pod
+		return true, pod, nil
+	})
 	k8s.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		getAction := action.(k8stesting.GetAction)
 		if getAction.GetName() != "target-scan-1" {
@@ -75,8 +82,34 @@ func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 	if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != sandboxRuntimeClassName {
 		t.Fatalf("expected pod runtimeClassName %q, got %#v", sandboxRuntimeClassName, pod.Spec.RuntimeClassName)
 	}
+	if createdPod == nil {
+		t.Fatalf("target pod create was not observed")
+	}
+	if createdPod.Spec.DNSPolicy != corev1.DNSNone {
+		t.Fatalf("expected target pod to use mock DNS, got %s", createdPod.Spec.DNSPolicy)
+	}
+	if createdPod.Spec.DNSConfig == nil || len(createdPod.Spec.DNSConfig.Nameservers) != 1 {
+		t.Fatalf("expected target pod mock DNS config, got %#v", createdPod.Spec.DNSConfig)
+	}
 	if _, err := k8s.CoreV1().Services(response.Namespace).Get(ctx, "svc-scan-1", metav1.GetOptions{}); err != nil {
 		t.Fatalf("service was not created: %v", err)
+	}
+	mockService, err := k8s.CoreV1().Services(response.Namespace).Get(ctx, externalMockName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("external mock service was not created: %v", err)
+	}
+	if len(mockService.Spec.Ports) != 4 {
+		t.Fatalf("expected external mock HTTP, HTTPS, and DNS ports, got %#v", mockService.Spec.Ports)
+	}
+	if _, err := k8s.AppsV1().Deployments(response.Namespace).Get(ctx, externalMockName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("external mock deployment was not created: %v", err)
+	}
+	mockConfig, err := k8s.CoreV1().ConfigMaps(response.Namespace).Get(ctx, externalMockName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("external mock configmap was not created: %v", err)
+	}
+	if !strings.Contains(mockConfig.Data["default.conf"], "listen 8443 ssl") {
+		t.Fatalf("expected HTTPS mock listener, got %q", mockConfig.Data["default.conf"])
 	}
 	policy, err := k8s.NetworkingV1().NetworkPolicies(response.Namespace).Get(ctx, "default-deny-egress", metav1.GetOptions{})
 	if err != nil {
@@ -324,7 +357,7 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	if mockService == nil {
 		t.Fatalf("external dependency mock service was not created")
 	}
-	if len(mockService.Spec.Ports) != 3 {
+	if len(mockService.Spec.Ports) != 4 {
 		t.Fatalf("unexpected mock service ports: %#v", mockService.Spec.Ports)
 	}
 	mockDeployment := createdDeployments[externalMockName]
@@ -343,6 +376,13 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	}
 	if !strings.Contains(mockConfig.Data["default.conf"], "return 200") {
 		t.Fatalf("expected HTTP mock to return 200, got %q", mockConfig.Data["default.conf"])
+	}
+	if !strings.Contains(mockConfig.Data["default.conf"], "listen 8443 ssl") {
+		t.Fatalf("expected HTTPS mock to listen with TLS, got %q", mockConfig.Data["default.conf"])
+	}
+	httpContainer := mockDeployment.Spec.Template.Spec.Containers[0]
+	if len(httpContainer.Args) != 1 || !strings.Contains(httpContainer.Args[0], "openssl req -x509") {
+		t.Fatalf("expected mock TLS material to be generated at startup, got %#v", httpContainer.Args)
 	}
 
 	apiDeployment := createdDeployments["api"]
