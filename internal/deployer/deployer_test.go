@@ -281,7 +281,19 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 					"name": "web frontend",
 					"image": "nginx:1.27",
 					"depends_on": ["api"],
+					"wait_for": ["api:8080"],
+					"command": ["/bin/sh"],
+					"args": ["-c", "nginx -g 'daemon off;'"] ,
+					"working_dir": "/app",
 					"env": {"API_URL": "http://api:8080"},
+					"init_containers": [{"name": "migrate db", "image": "busybox:1.36", "command": ["sh", "-c"], "args": ["echo migrate"]}],
+					"config_files": [{"path": "/app/config.yml", "content": "debug: true"}],
+					"secret_files": [{"path": "/app/secret.key", "content": "mock-secret"}],
+					"empty_dirs": [{"name": "uploads", "mount_path": "/app/uploads"}],
+					"resources": {"requests": {"cpu": "50m", "memory": "64Mi"}, "limits": {"cpu": "100m", "memory": "128Mi"}},
+					"security_context": {"runAsUser": 1000, "allowPrivilegeEscalation": false},
+					"pod_security_context": {"fsGroup": 1000},
+					"service": {"aliases": ["web-internal"]},
 					"livenessProbe": {
 						"httpGet": {
 							"host": "api.stripe.com",
@@ -327,6 +339,24 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	if webContainer.Image != "nginx:1.27" {
 		t.Fatalf("unexpected web image: %s", webContainer.Image)
 	}
+	if len(webContainer.Command) != 1 || webContainer.Command[0] != "/bin/sh" || webContainer.WorkingDir != "/app" {
+		t.Fatalf("unexpected command or working dir: %#v wd=%s", webContainer.Command, webContainer.WorkingDir)
+	}
+	if webContainer.Resources.Requests.Cpu().String() != "50m" || webContainer.Resources.Limits.Memory().String() != "128Mi" {
+		t.Fatalf("unexpected resources: %#v", webContainer.Resources)
+	}
+	if webContainer.SecurityContext == nil || webContainer.SecurityContext.RunAsUser == nil || *webContainer.SecurityContext.RunAsUser != 1000 {
+		t.Fatalf("expected container security context: %#v", webContainer.SecurityContext)
+	}
+	if webDeployment.Spec.Template.Spec.SecurityContext == nil || webDeployment.Spec.Template.Spec.SecurityContext.FSGroup == nil || *webDeployment.Spec.Template.Spec.SecurityContext.FSGroup != 1000 {
+		t.Fatalf("expected pod security context: %#v", webDeployment.Spec.Template.Spec.SecurityContext)
+	}
+	if len(webDeployment.Spec.Template.Spec.InitContainers) != 2 || webDeployment.Spec.Template.Spec.InitContainers[0].Name != "wait-for-api" {
+		t.Fatalf("expected wait_for and custom init containers: %#v", webDeployment.Spec.Template.Spec.InitContainers)
+	}
+	if len(webContainer.VolumeMounts) != 3 {
+		t.Fatalf("expected config, secret, and emptyDir mounts: %#v", webContainer.VolumeMounts)
+	}
 	if webContainer.ReadinessProbe == nil || webContainer.ReadinessProbe.TCPSocket == nil {
 		t.Fatalf("expected readiness probe on web deployment: %#v", webContainer.ReadinessProbe)
 	}
@@ -359,8 +389,19 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	if webService == nil {
 		t.Fatalf("web service was not created: %v", err)
 	}
+	if createdServices["web-internal"] == nil {
+		t.Fatalf("web alias service was not created")
+	}
 	if webService.Spec.Ports[0].Port != 80 || webService.Spec.Ports[0].TargetPort.IntVal != 8080 {
 		t.Fatalf("unexpected web service port: %#v", webService.Spec.Ports[0])
+	}
+	configMap, err := k8s.CoreV1().ConfigMaps(namespace).Get(ctx, "web-frontend-config", metav1.GetOptions{})
+	if err != nil || configMap.Data["config.yml"] != "debug: true" {
+		t.Fatalf("expected web config map, got %#v err=%v", configMap, err)
+	}
+	secret, err := k8s.CoreV1().Secrets(namespace).Get(ctx, "web-frontend-secret", metav1.GetOptions{})
+	if err != nil || secret.StringData["secret.key"] != "mock-secret" {
+		t.Fatalf("expected web secret, got %#v err=%v", secret, err)
 	}
 	mockService := createdServices[externalMockName]
 	if mockService == nil {
@@ -411,6 +452,58 @@ func indexOfString(values []string, target string) int {
 		}
 	}
 	return -1
+}
+
+func TestCreateSandboxCreatesStatefulTopologyWorkload(t *testing.T) {
+	ctx := context.Background()
+	namespace := "aegis-war-room-scan-1"
+	k8s := fake.NewSimpleClientset()
+	createdStatefulSets := map[string]*appsv1.StatefulSet{}
+	k8s.PrependReactor("create", "statefulsets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		statefulSet := createAction.GetObject().(*appsv1.StatefulSet)
+		createdStatefulSets[statefulSet.Name] = statefulSet
+		return true, statefulSet, nil
+	})
+	k8s.PrependReactor("get", "statefulsets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction := action.(k8stesting.GetAction)
+		statefulSet := createdStatefulSets[getAction.GetName()]
+		if statefulSet == nil {
+			return false, nil, nil
+		}
+		readyStatefulSet := statefulSet.DeepCopy()
+		readyStatefulSet.Namespace = namespace
+		readyStatefulSet.Generation = 1
+		readyStatefulSet.Status = appsv1.StatefulSetStatus{
+			ObservedGeneration: 1,
+			ReadyReplicas:      *statefulSet.Spec.Replicas,
+			UpdatedReplicas:    *statefulSet.Spec.Replicas,
+		}
+		return true, readyStatefulSet, nil
+	})
+	activities := NewActivities(k8s)
+
+	response, err := activities.CreateSandbox(ctx, SandboxRequest{
+		ScanID:       "scan-1",
+		TopologyJSON: `{"deployments":[{"name":"postgres","image":"postgres:16","stateful":true,"service":{"headless":true},"ports":[{"port":5432}]}]}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox returned error: %v", err)
+	}
+	if response.Endpoint != "http://postgres.aegis-war-room-scan-1.svc.cluster.local:5432" {
+		t.Fatalf("unexpected endpoint: %s", response.Endpoint)
+	}
+	statefulSet := createdStatefulSets["postgres"]
+	if statefulSet == nil || statefulSet.Spec.ServiceName != "postgres" {
+		t.Fatalf("expected postgres statefulset, got %#v", statefulSet)
+	}
+	service, err := k8s.CoreV1().Services(namespace).Get(ctx, "postgres", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected postgres service: %v", err)
+	}
+	if service.Spec.ClusterIP != corev1.ClusterIPNone {
+		t.Fatalf("expected headless service, got %#v", service.Spec)
+	}
 }
 
 func TestCreateSandboxUsesDefaultRuntimeWhenGVisorIsUnavailable(t *testing.T) {

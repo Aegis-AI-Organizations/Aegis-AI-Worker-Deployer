@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"path"
 	"strings"
+	"time"
 	"unicode"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -60,6 +62,16 @@ func (t *SandboxTopology) validate() error {
 		for _, port := range workload.Ports {
 			if port.servicePort() <= 0 || port.containerPort() <= 0 {
 				return fmt.Errorf("topology workload %q contains invalid port", name)
+			}
+		}
+		for _, file := range append(workload.ConfigFiles, workload.SecretFiles...) {
+			if strings.TrimSpace(file.Path) == "" {
+				return fmt.Errorf("topology workload %q contains file without path", name)
+			}
+		}
+		for _, volume := range workload.EmptyDirs {
+			if kubernetesName(volume.Name) == "" || strings.TrimSpace(volume.MountPath) == "" {
+				return fmt.Errorf("topology workload %q contains invalid empty_dir", name)
 			}
 		}
 	}
@@ -144,14 +156,28 @@ func (w *TopologyWorkload) UnmarshalJSON(data []byte) error {
 	}
 
 	*w = TopologyWorkload{
-		ID:        strings.TrimSpace(alias.ID),
-		Name:      strings.TrimSpace(alias.Name),
-		Image:     strings.TrimSpace(alias.Image),
-		Ports:     alias.Ports,
-		Env:       env,
-		Replicas:  alias.Replicas,
-		Liveness:  liveness,
-		DependsOn: normalizeTopologyDependencies(alias.DependsOn),
+		ID:                 strings.TrimSpace(alias.ID),
+		Name:               strings.TrimSpace(alias.Name),
+		Image:              strings.TrimSpace(alias.Image),
+		Ports:              alias.Ports,
+		Env:                env,
+		Replicas:           alias.Replicas,
+		Liveness:           liveness,
+		DependsOn:          normalizeTopologyDependencies(alias.DependsOn),
+		WaitFor:            normalizeTopologyWaitFor(alias.WaitFor),
+		Required:           alias.Required,
+		Command:            alias.Command,
+		Args:               alias.Args,
+		WorkingDir:         strings.TrimSpace(alias.WorkingDir),
+		InitContainers:     alias.InitContainers,
+		ConfigFiles:        alias.ConfigFiles,
+		SecretFiles:        alias.SecretFiles,
+		EmptyDirs:          alias.EmptyDirs,
+		Resources:          alias.Resources,
+		SecurityContext:    alias.SecurityContext,
+		PodSecurityContext: alias.PodSecurityContext,
+		Stateful:           alias.Stateful,
+		Service:            alias.Service,
 	}
 	return nil
 }
@@ -171,6 +197,23 @@ func normalizeTopologyDependencies(values []string) []string {
 		dependencies = append(dependencies, dependency)
 	}
 	return dependencies
+}
+
+func normalizeTopologyWaitFor(values []string) []string {
+	targets := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		target := strings.TrimSpace(value)
+		if target == "" {
+			continue
+		}
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		seen[target] = struct{}{}
+		targets = append(targets, target)
+	}
+	return targets
 }
 
 func parseTopologyEnv(raw json.RawMessage) (map[string]string, error) {
@@ -307,9 +350,16 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 	for _, workload := range createdWorkloads {
 		name := kubernetesName(workload.Name)
 		ports := workload.normalizedPorts()
-		if err := a.waitForDeploymentReady(ctx, namespace, name, topologyDeploymentReadyTimeout); err != nil {
+		if err := a.waitForTopologyWorkloadReady(ctx, namespace, name, workload, topologyDeploymentReadyTimeout); err != nil {
 			log.Printf("[CreateSandbox] deployment %s/%s is not ready; continuing topology deployment: %v", namespace, name, err)
 			updateWorkloadStatus(statuses, name, "not_ready", "", err.Error())
+			if workload.required() {
+				return SandboxResponse{
+					Namespace: namespace,
+					Workloads: statuses,
+					Summary:   summarizeSandboxWorkloads(len(workloads), statuses, false),
+				}, fmt.Errorf("required topology workload %q is not ready: %w", name, err)
+			}
 			continue
 		}
 		endpoint := workloadEndpoint(namespace, name, ports)
@@ -497,6 +547,9 @@ func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, na
 	if workload.Replicas != nil && *workload.Replicas > 0 {
 		replicas = *workload.Replicas
 	}
+	if err := a.createWorkloadFileResources(ctx, namespace, name, workload); err != nil {
+		return err
+	}
 	containerPorts := workload.containerPorts()
 	readinessProbe := localTCPProbe(containerPorts)
 	var livenessProbe *corev1.Probe
@@ -511,6 +564,35 @@ func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, na
 	}
 	labels := topologyLabels(scanID, name)
 	runtimeClassName := a.sandboxRuntimeClassName(ctx)
+	podSpec := corev1.PodSpec{
+		RuntimeClassName: runtimeClassName,
+		DNSPolicy:        dnsPolicy,
+		DNSConfig:        dnsConfig,
+		SecurityContext:  workload.PodSecurityContext,
+		InitContainers:   workload.initContainers(),
+		Volumes:          workload.volumes(name),
+		Containers: []corev1.Container{{
+			Name:            name,
+			Image:           strings.TrimSpace(workload.Image),
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			Command:         workload.Command,
+			Args:            workload.Args,
+			WorkingDir:      workload.WorkingDir,
+			Ports:           containerPorts,
+			Env:             workload.envVars(),
+			Resources:       workload.Resources,
+			SecurityContext: workload.SecurityContext,
+			VolumeMounts:    workload.volumeMounts(name),
+			ReadinessProbe:  readinessProbe,
+			LivenessProbe:   livenessProbe,
+		}},
+	}
+	if len(workload.WaitFor) > 0 {
+		podSpec.InitContainers = append(workload.waitForInitContainers(), podSpec.InitContainers...)
+	}
+	if workload.Stateful {
+		return a.createStatefulSet(ctx, namespace, scanID, name, labels, replicas, podSpec, workload)
+	}
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   name,
@@ -525,20 +607,7 @@ func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, na
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: labels,
 				},
-				Spec: corev1.PodSpec{
-					RuntimeClassName: runtimeClassName,
-					DNSPolicy:        dnsPolicy,
-					DNSConfig:        dnsConfig,
-					Containers: []corev1.Container{{
-						Name:            name,
-						Image:           strings.TrimSpace(workload.Image),
-						ImagePullPolicy: corev1.PullIfNotPresent,
-						Ports:           containerPorts,
-						Env:             workload.envVars(),
-						ReadinessProbe:  readinessProbe,
-						LivenessProbe:   livenessProbe,
-					}},
-				},
+				Spec: podSpec,
 			},
 		},
 	}
@@ -553,6 +622,230 @@ func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, na
 	}
 	log.Printf("[CreateSandbox] deployment %s/%s created replicas=%d image=%s", namespace, name, replicas, workload.Image)
 	return nil
+}
+
+func (a *Activities) createStatefulSet(ctx context.Context, namespace, scanID, name string, labels map[string]string, replicas int32, podSpec corev1.PodSpec, workload TopologyWorkload) error {
+	statefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   name,
+			Labels: labels,
+		},
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName: name,
+			Replicas:    &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: podSpec,
+			},
+		},
+	}
+
+	_, err := a.k8s.AppsV1().StatefulSets(namespace).Create(ctx, statefulSet, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		log.Printf("[CreateSandbox] statefulset %s/%s already exists", namespace, name)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("create statefulset %s/%s: %w", namespace, name, err)
+	}
+	log.Printf("[CreateSandbox] statefulset %s/%s created replicas=%d image=%s", namespace, name, replicas, workload.Image)
+	return nil
+}
+
+func (a *Activities) createWorkloadFileResources(ctx context.Context, namespace, name string, workload TopologyWorkload) error {
+	if len(workload.ConfigFiles) > 0 {
+		configMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: workloadConfigMapName(name)},
+			Data:       map[string]string{},
+		}
+		for _, file := range workload.ConfigFiles {
+			configMap.Data[fileKey(file.Path)] = file.Content
+		}
+		if _, err := a.k8s.CoreV1().ConfigMaps(namespace).Create(ctx, configMap, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create configmap %s/%s: %w", namespace, configMap.Name, err)
+		}
+	}
+	if len(workload.SecretFiles) > 0 {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: workloadSecretName(name)},
+			StringData: map[string]string{},
+		}
+		for _, file := range workload.SecretFiles {
+			secret.StringData[fileKey(file.Path)] = file.Content
+		}
+		if _, err := a.k8s.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create secret %s/%s: %w", namespace, secret.Name, err)
+		}
+	}
+	return nil
+}
+
+func (w TopologyWorkload) initContainers() []corev1.Container {
+	containers := make([]corev1.Container, 0, len(w.InitContainers))
+	for _, init := range w.InitContainers {
+		name := kubernetesName(init.Name)
+		if name == "" {
+			name = "init"
+		}
+		containers = append(containers, corev1.Container{
+			Name:            name,
+			Image:           strings.TrimSpace(init.Image),
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			Command:         init.Command,
+			Args:            init.Args,
+			WorkingDir:      strings.TrimSpace(init.WorkingDir),
+			Env:             topologyEnvVars(init.Env),
+			VolumeMounts:    w.volumeMounts(kubernetesName(w.Name)),
+		})
+	}
+	return containers
+}
+
+func (w TopologyWorkload) waitForInitContainers() []corev1.Container {
+	containers := make([]corev1.Container, 0, len(w.WaitFor))
+	for _, target := range w.WaitFor {
+		parts := strings.Split(target, ":")
+		host := kubernetesName(parts[0])
+		port := "80"
+		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+			port = strings.TrimSpace(parts[1])
+		}
+		containers = append(containers, corev1.Container{
+			Name:            "wait-for-" + host,
+			Image:           "busybox:1.36",
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			Command:         []string{"sh", "-c"},
+			Args:            []string{fmt.Sprintf("until nc -z %s %s; do sleep 2; done", host, port)},
+		})
+	}
+	return containers
+}
+
+func (w TopologyWorkload) volumes(name string) []corev1.Volume {
+	volumes := []corev1.Volume{}
+	if len(w.ConfigFiles) > 0 {
+		volumes = append(volumes, corev1.Volume{
+			Name: workloadConfigVolumeName(name),
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: workloadConfigMapName(name)},
+			}},
+		})
+	}
+	if len(w.SecretFiles) > 0 {
+		volumes = append(volumes, corev1.Volume{
+			Name: workloadSecretVolumeName(name),
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: workloadSecretName(name),
+			}},
+		})
+	}
+	for _, emptyDir := range w.EmptyDirs {
+		volumes = append(volumes, corev1.Volume{
+			Name:         kubernetesName(emptyDir.Name),
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		})
+	}
+	return volumes
+}
+
+func (w TopologyWorkload) volumeMounts(name string) []corev1.VolumeMount {
+	mounts := []corev1.VolumeMount{}
+	for _, file := range w.ConfigFiles {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      workloadConfigVolumeName(name),
+			MountPath: strings.TrimSpace(file.Path),
+			SubPath:   fileKey(file.Path),
+			ReadOnly:  true,
+		})
+	}
+	for _, file := range w.SecretFiles {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      workloadSecretVolumeName(name),
+			MountPath: strings.TrimSpace(file.Path),
+			SubPath:   fileKey(file.Path),
+			ReadOnly:  true,
+		})
+	}
+	for _, emptyDir := range w.EmptyDirs {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      kubernetesName(emptyDir.Name),
+			MountPath: strings.TrimSpace(emptyDir.MountPath),
+		})
+	}
+	return mounts
+}
+
+func fileKey(filePath string) string {
+	key := path.Base(strings.TrimSpace(filePath))
+	if key == "." || key == "/" || key == "" {
+		return "file"
+	}
+	return key
+}
+
+func workloadConfigMapName(name string) string    { return name + "-config" }
+func workloadSecretName(name string) string       { return name + "-secret" }
+func workloadConfigVolumeName(name string) string { return name + "-config" }
+func workloadSecretVolumeName(name string) string { return name + "-secret" }
+
+func (w TopologyWorkload) required() bool {
+	return w.Required != nil && *w.Required
+}
+
+func (a *Activities) waitForTopologyWorkloadReady(ctx context.Context, namespace, name string, workload TopologyWorkload, timeout time.Duration) error {
+	if workload.Stateful {
+		return a.waitForStatefulSetReady(ctx, namespace, name, timeout)
+	}
+	return a.waitForDeploymentReady(ctx, namespace, name, timeout)
+}
+
+func (a *Activities) waitForStatefulSetReady(ctx context.Context, namespace, name string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	log.Printf("[CreateSandbox] waiting for statefulset %s/%s readiness (timeout=%s)", namespace, name, timeout)
+	lastSummary := ""
+	for {
+		statefulSet, err := a.k8s.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("read statefulset %s/%s: %w", namespace, name, err)
+		}
+
+		expected := int32(1)
+		if statefulSet.Spec.Replicas != nil {
+			expected = *statefulSet.Spec.Replicas
+		}
+		summary := fmt.Sprintf(
+			"replicas=%d ready=%d updated=%d observed_generation=%d generation=%d",
+			expected,
+			statefulSet.Status.ReadyReplicas,
+			statefulSet.Status.UpdatedReplicas,
+			statefulSet.Status.ObservedGeneration,
+			statefulSet.Generation,
+		)
+		if summary != lastSummary {
+			log.Printf("[CreateSandbox] statefulset %s/%s status=%s", namespace, name, summary)
+			lastSummary = summary
+		}
+		if statefulSet.Status.ObservedGeneration >= statefulSet.Generation && statefulSet.Status.ReadyReplicas >= expected {
+			log.Printf("[CreateSandbox] statefulset %s/%s is Ready", namespace, name)
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for statefulset %s/%s to become ready", namespace, name)
+		case <-ticker.C:
+		}
+	}
 }
 
 func localTCPProbe(containerPorts []corev1.ContainerPort) *corev1.Probe {
@@ -573,27 +866,61 @@ func localTCPProbe(containerPorts []corev1.ContainerPort) *corev1.Probe {
 }
 
 func (a *Activities) createTopologyService(ctx context.Context, namespace, scanID, name string, workload TopologyWorkload) error {
+	serviceType := corev1.ServiceTypeClusterIP
+	switch strings.ToLower(strings.TrimSpace(workload.Service.Type)) {
+	case "nodeport":
+		serviceType = corev1.ServiceTypeNodePort
+	case "loadbalancer", "load_balancer":
+		serviceType = corev1.ServiceTypeLoadBalancer
+	}
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   name,
 			Labels: topologyLabels(scanID, name),
 		},
 		Spec: corev1.ServiceSpec{
-			Type:     corev1.ServiceTypeClusterIP,
+			Type:     serviceType,
 			Selector: topologyLabels(scanID, name),
 			Ports:    workload.servicePorts(),
 		},
 	}
+	if workload.Service.Headless {
+		service.Spec.Type = corev1.ServiceTypeClusterIP
+		service.Spec.ClusterIP = corev1.ClusterIPNone
+	}
 
+	if err := a.createServiceObject(ctx, namespace, service); err != nil {
+		return err
+	}
+	for _, alias := range workload.Service.Aliases {
+		aliasName := kubernetesName(alias)
+		if aliasName == "" || aliasName == name {
+			continue
+		}
+		aliasService := service.DeepCopy()
+		aliasService.Name = aliasName
+		aliasService.ResourceVersion = ""
+		aliasService.Spec.ClusterIP = ""
+		if workload.Service.Headless {
+			aliasService.Spec.ClusterIP = corev1.ClusterIPNone
+		}
+		if err := a.createServiceObject(ctx, namespace, aliasService); err != nil {
+			return err
+		}
+	}
+	log.Printf("[CreateSandbox] service %s/%s created with %d port(s)", namespace, name, len(service.Spec.Ports))
+	return nil
+}
+
+func (a *Activities) createServiceObject(ctx context.Context, namespace string, service *corev1.Service) error {
 	_, err := a.k8s.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
-		log.Printf("[CreateSandbox] service %s/%s already exists", namespace, name)
+		log.Printf("[CreateSandbox] service %s/%s already exists", namespace, service.Name)
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("create service %s/%s: %w", namespace, name, err)
+		return fmt.Errorf("create service %s/%s: %w", namespace, service.Name, err)
 	}
-	log.Printf("[CreateSandbox] service %s/%s created with %d port(s)", namespace, name, len(service.Spec.Ports))
 	return nil
 }
 
@@ -715,11 +1042,15 @@ func (w TopologyWorkload) servicePorts() []corev1.ServicePort {
 }
 
 func (w TopologyWorkload) envVars() []corev1.EnvVar {
-	if len(w.Env) == 0 {
+	return topologyEnvVars(w.Env)
+}
+
+func topologyEnvVars(values map[string]string) []corev1.EnvVar {
+	if len(values) == 0 {
 		return nil
 	}
-	envVars := make([]corev1.EnvVar, 0, len(w.Env))
-	for key, value := range w.Env {
+	envVars := make([]corev1.EnvVar, 0, len(values))
+	for key, value := range values {
 		key = strings.TrimSpace(key)
 		if shouldDropTopologyEnv(key) {
 			continue

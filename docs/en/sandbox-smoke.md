@@ -15,6 +15,9 @@ The fixture deploys:
 - `vulnerable-webapp`: HTTP entrypoint on service port `80`, container port `5000`.
 - `postgres`: PostgreSQL service on port `5432`.
 - `depends_on`: the app declares `postgres` as a dependency so the deployer creates the database workload first.
+- `wait_for`: the app gets an init container that waits for `postgres:5432` before starting.
+- `config_files` and `empty_dirs`: the app receives mounted configuration and writable upload storage.
+- `stateful` and `headless`: PostgreSQL is rendered as a StatefulSet with a stable DNS identity.
 - App-to-DB mapping through `DATABASE_URL` and `POSTGRES_*` env vars.
 - External dependency URL pointing to `https://payments.example.test/api/v1`, which should be intercepted by the sandbox external mock/DNS layer.
 
@@ -25,6 +28,25 @@ The expected pentest loop is:
 3. Deployer creates workloads, services, default-deny egress, and external mock DNS/HTTP/HTTPS services.
 4. Brain seeds PostgreSQL with realistic data and `aegis-flag-1234`.
 5. Worker Pentest exploits SQLi and reports `loot_proof` and `exfiltrated_data`.
+
+## Fidelity Fields Supported By The Deployer
+
+Topology workloads can now express these Kubernetes fidelity controls:
+
+- Startup: `command`, `args`, `working_dir`, `init_containers`.
+- Dependency startup: `depends_on` for creation order and `wait_for` for init-container TCP waits such as `postgres:5432`.
+- Files and storage: `config_files`, `secret_files`, and `empty_dirs` mounted into the workload container.
+- Workload identity: `stateful: true` renders a StatefulSet instead of a Deployment.
+- Services: `service.headless`, `service.type`, named ports, and same-namespace DNS aliases through `service.aliases`.
+- Resources: Kubernetes `resources.requests` and `resources.limits`.
+- Security: container `security_context` and pod `pod_security_context`.
+- Readiness policy: `required: true` fails sandbox creation if that workload never becomes ready.
+
+Fields intentionally handled outside this worker:
+
+- Database dump restore from MinIO/S3 belongs in Brain seeding activities.
+- Scenario-rich external API responses and traffic capture require the external mock runtime to persist request logs.
+- Ingress/TLS virtual-host exposure requires cluster ingress/controller configuration and should be added with infra manifests.
 
 ## Smoke Test
 

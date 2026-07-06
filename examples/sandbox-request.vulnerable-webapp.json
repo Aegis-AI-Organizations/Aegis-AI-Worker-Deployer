@@ -8,6 +8,28 @@
         "name": "vulnerable-webapp",
         "image": "ghcr.io/aegis-ai-organizations/vuln-app:latest",
         "depends_on": ["postgres"],
+        "wait_for": ["postgres:5432"],
+        "working_dir": "/app",
+        "config_files": [
+          {
+            "path": "/app/config.yml",
+            "content": "feature_insecure_search: true\nexternal_api_url: https://payments.example.test/api/v1\n"
+          }
+        ],
+        "empty_dirs": [
+          {
+            "name": "uploads",
+            "mount_path": "/app/uploads"
+          }
+        ],
+        "resources": {
+          "requests": {"cpu": "50m", "memory": "64Mi"},
+          "limits": {"cpu": "250m", "memory": "256Mi"}
+        },
+        "security_context": {
+          "runAsUser": 1000,
+          "allowPrivilegeEscalation": false
+        },
         "ports": [
           {
             "name": "http",
@@ -42,6 +64,12 @@
         "id": "db-1",
         "name": "postgres",
         "image": "postgres:16-alpine",
+        "stateful": true,
+        "required": true,
+        "service": {
+          "headless": true,
+          "aliases": ["db"]
+        },
         "ports": [
           {
             "name": "postgres",
