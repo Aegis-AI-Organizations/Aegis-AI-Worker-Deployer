@@ -1,0 +1,57 @@
+{
+  "services": [
+    {
+      "id": "webapp-1",
+      "name": "vulnerable-webapp",
+      "image": "ghcr.io/aegis-ai-organizations/vuln-app:latest",
+      "ports": [
+        {
+          "name": "http",
+          "port": 80,
+          "target_port": 5000,
+          "container_port": 5000,
+          "protocol": "TCP"
+        }
+      ],
+      "env": {
+        "DATABASE_URL": "postgresql://aegis:aegis@postgres:5432/aegis_demo",
+        "POSTGRES_HOST": "postgres",
+        "POSTGRES_PORT": "5432",
+        "POSTGRES_DB": "aegis_demo",
+        "POSTGRES_USER": "aegis",
+        "POSTGRES_PASSWORD": "aegis",
+        "EXTERNAL_API_URL": "https://payments.example.test/api/v1",
+        "FEATURE_INSECURE_SEARCH": "true"
+      },
+      "liveness_probe": {
+        "httpGet": {
+          "path": "/health",
+          "port": 5000
+        },
+        "initialDelaySeconds": 5,
+        "periodSeconds": 10
+      }
+    }
+  ],
+  "deployments": [
+    {
+      "id": "db-1",
+      "name": "postgres",
+      "image": "postgres:16-alpine",
+      "ports": [
+        {
+          "name": "postgres",
+          "port": 5432,
+          "target_port": 5432,
+          "container_port": 5432,
+          "protocol": "TCP"
+        }
+      ],
+      "env": {
+        "POSTGRES_DB": "aegis_demo",
+        "POSTGRES_USER": "aegis",
+        "POSTGRES_PASSWORD": "aegis"
+      }
+    }
+  ]
+}

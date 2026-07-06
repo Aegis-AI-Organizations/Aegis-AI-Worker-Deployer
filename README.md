@@ -72,4 +72,22 @@ go test ./...
 
 ---
 
+## 🧪 Sandbox Smoke Fixture
+
+Use the canonical vulnerable sandbox fixture to validate the full clone path:
+
+- `examples/sandbox-topology.vulnerable-webapp.json`
+- `examples/sandbox-request.vulnerable-webapp.json`
+- `scripts/sandbox_smoke.sh`
+
+After a sandbox has been created by the worker, validate it with:
+
+```bash
+scripts/sandbox_smoke.sh --scan-id smoke-sqli-001
+```
+
+See `docs/en/sandbox-smoke.md` for the full workflow, expected resources, endpoint checks, and cleanup instructions.
+
+---
+
 *Aegis AI — Infrastructure & Digital Twins — 2026*
