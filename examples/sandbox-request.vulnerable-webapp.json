@@ -7,6 +7,7 @@
         "id": "webapp-1",
         "name": "vulnerable-webapp",
         "image": "ghcr.io/aegis-ai-organizations/vuln-app:latest",
+        "depends_on": ["postgres"],
         "ports": [
           {
             "name": "http",

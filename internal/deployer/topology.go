@@ -63,6 +63,9 @@ func (t *SandboxTopology) validate() error {
 			}
 		}
 	}
+	if _, err := orderedTopologyWorkloads(workloads); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -72,6 +75,50 @@ func (t *SandboxTopology) workloads() []TopologyWorkload {
 	workloads = append(workloads, t.Deployments...)
 	workloads = append(workloads, t.Containers...)
 	return workloads
+}
+
+func orderedTopologyWorkloads(workloads []TopologyWorkload) ([]TopologyWorkload, error) {
+	byName := make(map[string]TopologyWorkload, len(workloads))
+	for _, workload := range workloads {
+		byName[kubernetesName(workload.Name)] = workload
+	}
+
+	ordered := make([]TopologyWorkload, 0, len(workloads))
+	state := make(map[string]int, len(workloads))
+	var visit func(TopologyWorkload) error
+	visit = func(workload TopologyWorkload) error {
+		name := kubernetesName(workload.Name)
+		switch state[name] {
+		case 1:
+			return fmt.Errorf("topology dependency cycle detected at workload %q", name)
+		case 2:
+			return nil
+		}
+
+		state[name] = 1
+		for _, dependency := range normalizeTopologyDependencies(workload.DependsOn) {
+			dependencyWorkload, ok := byName[dependency]
+			if !ok {
+				return fmt.Errorf("topology workload %q depends on unknown workload %q", name, dependency)
+			}
+			if dependency == name {
+				return fmt.Errorf("topology workload %q cannot depend on itself", name)
+			}
+			if err := visit(dependencyWorkload); err != nil {
+				return err
+			}
+		}
+		state[name] = 2
+		ordered = append(ordered, workload)
+		return nil
+	}
+
+	for _, workload := range workloads {
+		if err := visit(workload); err != nil {
+			return nil, err
+		}
+	}
+	return ordered, nil
 }
 
 func (w *TopologyWorkload) UnmarshalJSON(data []byte) error {
@@ -97,15 +144,33 @@ func (w *TopologyWorkload) UnmarshalJSON(data []byte) error {
 	}
 
 	*w = TopologyWorkload{
-		ID:       strings.TrimSpace(alias.ID),
-		Name:     strings.TrimSpace(alias.Name),
-		Image:    strings.TrimSpace(alias.Image),
-		Ports:    alias.Ports,
-		Env:      env,
-		Replicas: alias.Replicas,
-		Liveness: liveness,
+		ID:        strings.TrimSpace(alias.ID),
+		Name:      strings.TrimSpace(alias.Name),
+		Image:     strings.TrimSpace(alias.Image),
+		Ports:     alias.Ports,
+		Env:       env,
+		Replicas:  alias.Replicas,
+		Liveness:  liveness,
+		DependsOn: normalizeTopologyDependencies(alias.DependsOn),
 	}
 	return nil
+}
+
+func normalizeTopologyDependencies(values []string) []string {
+	dependencies := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		dependency := kubernetesName(value)
+		if dependency == "" {
+			continue
+		}
+		if _, ok := seen[dependency]; ok {
+			continue
+		}
+		seen[dependency] = struct{}{}
+		dependencies = append(dependencies, dependency)
+	}
+	return dependencies
 }
 
 func parseTopologyEnv(raw json.RawMessage) (map[string]string, error) {
@@ -159,6 +224,10 @@ func parseTopologyProbe(rawValues ...json.RawMessage) (*corev1.Probe, error) {
 
 func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespace string, topology *SandboxTopology, preferredEndpointWorkload string) (SandboxResponse, error) {
 	workloads := topology.workloads()
+	orderedWorkloads, err := orderedTopologyWorkloads(workloads)
+	if err != nil {
+		return SandboxResponse{}, err
+	}
 	log.Printf("[CreateSandbox] scan=%s deploying topology with %d workload(s)", scanID, len(workloads))
 	if len(workloads) == 0 {
 		return SandboxResponse{}, errors.New("topology does not contain any workload")
@@ -173,17 +242,14 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 		preferredEndpointWorkload = kubernetesName(preferredEndpointWorkload)
 	}
 	mockSecret := mockTopologySecret(scanID)
-	firstServiceName := ""
+	firstServiceName := kubernetesName(workloads[0].Name)
 	firstReadyServiceName := ""
 	firstReadyServicePort := int32(0)
 	createdWorkloads := make([]TopologyWorkload, 0, len(workloads))
 	statuses := make([]SandboxWorkloadStatus, 0, len(workloads))
-	for index, workload := range workloads {
+	for index, workload := range orderedWorkloads {
 		workload = sanitizeTopologySecrets(workload, mockSecret)
 		name := kubernetesName(workload.Name)
-		if firstServiceName == "" {
-			firstServiceName = name
-		}
 
 		log.Printf(
 			"[CreateSandbox] scan=%s topology workload %d/%d name=%s image=%s ports=%d env=%d",
@@ -248,9 +314,16 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 		}
 		endpoint := workloadEndpoint(namespace, name, ports)
 		updateWorkloadStatus(statuses, name, "ready", endpoint, "")
-		if firstReadyServiceName == "" && len(ports) > 0 {
+	}
+
+	for _, workload := range workloads {
+		name := kubernetesName(workload.Name)
+		status, ok := findWorkloadStatus(statuses, name)
+		ports := workload.normalizedPorts()
+		if ok && status.Status == "ready" && len(ports) > 0 {
 			firstReadyServiceName = name
 			firstReadyServicePort = ports[0].servicePort()
+			break
 		}
 	}
 

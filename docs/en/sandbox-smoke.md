@@ -14,6 +14,7 @@ The fixture deploys:
 
 - `vulnerable-webapp`: HTTP entrypoint on service port `80`, container port `5000`.
 - `postgres`: PostgreSQL service on port `5432`.
+- `depends_on`: the app declares `postgres` as a dependency so the deployer creates the database workload first.
 - App-to-DB mapping through `DATABASE_URL` and `POSTGRES_*` env vars.
 - External dependency URL pointing to `https://payments.example.test/api/v1`, which should be intercepted by the sandbox external mock/DNS layer.
 
@@ -61,6 +62,7 @@ The script refuses to delete namespaces that do not start with `aegis-war-room-`
 - Namespace exists.
 - Network policies are present.
 - Services include the app, database, and external mock.
+- Dependency order creates database/cache workloads before dependent apps when `depends_on` is present.
 - Deployments become available or show actionable errors.
 - Pods become ready or show actionable errors.
 - Endpoint responds from inside the namespace.

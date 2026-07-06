@@ -48,13 +48,14 @@ type SandboxTopology struct {
 }
 
 type TopologyWorkload struct {
-	ID       string            `json:"id,omitempty"`
-	Name     string            `json:"name"`
-	Image    string            `json:"image"`
-	Ports    []TopologyPort    `json:"ports,omitempty"`
-	Env      map[string]string `json:"env,omitempty"`
-	Replicas *int32            `json:"replicas,omitempty"`
-	Liveness *corev1.Probe     `json:"liveness_probe,omitempty"`
+	ID        string            `json:"id,omitempty"`
+	Name      string            `json:"name"`
+	Image     string            `json:"image"`
+	Ports     []TopologyPort    `json:"ports,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	Replicas  *int32            `json:"replicas,omitempty"`
+	Liveness  *corev1.Probe     `json:"liveness_probe,omitempty"`
+	DependsOn []string          `json:"depends_on,omitempty"`
 }
 
 type TopologyPort struct {
@@ -76,6 +77,7 @@ type topologyWorkloadAlias struct {
 	Replicas      *int32          `json:"replicas,omitempty"`
 	Liveness      json.RawMessage `json:"liveness_probe,omitempty"`
 	LivenessCamel json.RawMessage `json:"livenessProbe,omitempty"`
+	DependsOn     []string        `json:"depends_on,omitempty"`
 }
 
 type Activities struct {

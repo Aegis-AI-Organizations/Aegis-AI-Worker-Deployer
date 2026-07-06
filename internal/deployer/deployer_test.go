@@ -239,11 +239,13 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	t.Setenv(sandboxRuntimeClassEnv, sandboxRuntimeClassName)
 	k8s := fake.NewSimpleClientset(fakeSandboxRuntimeClass())
 	createdDeployments := map[string]*appsv1.Deployment{}
+	createdDeploymentOrder := []string{}
 	createdServices := map[string]*corev1.Service{}
 	k8s.PrependReactor("create", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		createAction := action.(k8stesting.CreateAction)
 		deployment := createAction.GetObject().(*appsv1.Deployment)
 		createdDeployments[deployment.Name] = deployment
+		createdDeploymentOrder = append(createdDeploymentOrder, deployment.Name)
 		return true, deployment, nil
 	})
 	k8s.PrependReactor("create", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
@@ -278,6 +280,7 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 				{
 					"name": "web frontend",
 					"image": "nginx:1.27",
+					"depends_on": ["api"],
 					"env": {"API_URL": "http://api:8080"},
 					"livenessProbe": {
 						"httpGet": {
@@ -305,6 +308,12 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	}
 	if response.Endpoint != "http://web-frontend.aegis-war-room-scan-1.svc.cluster.local:80" {
 		t.Fatalf("unexpected endpoint: %s", response.Endpoint)
+	}
+	if indexOfString(createdDeploymentOrder, "api") == -1 || indexOfString(createdDeploymentOrder, "web-frontend") == -1 {
+		t.Fatalf("expected api and web deployments to be created, got %#v", createdDeploymentOrder)
+	}
+	if indexOfString(createdDeploymentOrder, "api") > indexOfString(createdDeploymentOrder, "web-frontend") {
+		t.Fatalf("expected api dependency before web deployment, got %#v", createdDeploymentOrder)
 	}
 
 	webDeployment := createdDeployments["web-frontend"]
@@ -393,6 +402,15 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	if len(apiContainer.Env) != 1 || apiContainer.Env[0].Name != "DB_HOST" || apiContainer.Env[0].Value != "postgres" {
 		t.Fatalf("unexpected api env: %#v", apiContainer.Env)
 	}
+}
+
+func indexOfString(values []string, target string) int {
+	for index, value := range values {
+		if value == target {
+			return index
+		}
+	}
+	return -1
 }
 
 func TestCreateSandboxUsesDefaultRuntimeWhenGVisorIsUnavailable(t *testing.T) {
@@ -833,6 +851,24 @@ func TestParseTopologyValidatesTypingAndCollisions(t *testing.T) {
 		}
 	})
 
+	t.Run("orders dependencies before dependents", func(t *testing.T) {
+		req := SandboxRequest{TopologyJSON: `{
+			"services":[{"name":"web","image":"web:latest","depends_on":["postgres"]}],
+			"deployments":[{"name":"postgres","image":"postgres:16"}]
+		}`}
+		topology, err := req.parseTopology()
+		if err != nil {
+			t.Fatalf("parseTopology returned error: %v", err)
+		}
+		ordered, err := orderedTopologyWorkloads(topology.workloads())
+		if err != nil {
+			t.Fatalf("orderedTopologyWorkloads returned error: %v", err)
+		}
+		if len(ordered) != 2 || ordered[0].Name != "postgres" || ordered[1].Name != "web" {
+			t.Fatalf("unexpected dependency order: %#v", ordered)
+		}
+	})
+
 	t.Run("invalid env type", func(t *testing.T) {
 		req := SandboxRequest{TopologyJSON: `{"services":[{"name":"api","image":"api:latest","env":42}]}`}
 		if _, err := req.parseTopology(); err == nil || !strings.Contains(err.Error(), "env must be an object") {
@@ -844,6 +880,20 @@ func TestParseTopologyValidatesTypingAndCollisions(t *testing.T) {
 		req := SandboxRequest{TopologyJSON: `{"services":[{"name":"api.v1","image":"api:1"},{"name":"api v1","image":"api:2"}]}`}
 		if _, err := req.parseTopology(); err == nil || !strings.Contains(err.Error(), "collides") {
 			t.Fatalf("expected collision error, got %v", err)
+		}
+	})
+
+	t.Run("unknown dependency", func(t *testing.T) {
+		req := SandboxRequest{TopologyJSON: `{"services":[{"name":"api","image":"api:latest","depends_on":["postgres"]}]}`}
+		if _, err := req.parseTopology(); err == nil || !strings.Contains(err.Error(), "depends on unknown workload") {
+			t.Fatalf("expected unknown dependency error, got %v", err)
+		}
+	})
+
+	t.Run("dependency cycle", func(t *testing.T) {
+		req := SandboxRequest{TopologyJSON: `{"services":[{"name":"api","image":"api:latest","depends_on":["web"]},{"name":"web","image":"web:latest","depends_on":["api"]}]}`}
+		if _, err := req.parseTopology(); err == nil || !strings.Contains(err.Error(), "dependency cycle") {
+			t.Fatalf("expected dependency cycle error, got %v", err)
 		}
 	})
 }
