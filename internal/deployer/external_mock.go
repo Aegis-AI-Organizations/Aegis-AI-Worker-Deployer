@@ -179,10 +179,10 @@ func externalMockLocations(scenarios []ExternalMockScenario) string {
 			fmt.Fprintf(&builder, "        if ($request_method != '%s') { return 405 ''; }\n", entry.method)
 		}
 		for key, value := range entry.route.Headers {
-			builder.WriteString(fmt.Sprintf("        add_header %s '%s';\n", kubernetesName(key), strings.ReplaceAll(value, "'", "\\'")))
+			fmt.Fprintf(&builder, "        add_header %s '%s';\n", kubernetesName(key), strings.ReplaceAll(value, "'", "\\'"))
 		}
 		builder.WriteString("        add_header Content-Type application/json;\n")
-		builder.WriteString(fmt.Sprintf("        return %d '%s';\n", status, body))
+		fmt.Fprintf(&builder, "        return %d '%s';\n", status, body)
 		builder.WriteString("    }\n")
 	}
 	return builder.String()
