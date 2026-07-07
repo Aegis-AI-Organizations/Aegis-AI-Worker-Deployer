@@ -53,10 +53,14 @@ func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (San
 	}
 
 	if topology != nil {
-		return a.createTopologySandbox(ctx, req.ScanID, namespace, topology, req.PreferredEndpointWorkload)
+		response, err := a.createTopologySandbox(ctx, req.ScanID, namespace, topology, req.PreferredEndpointWorkload)
+		if err == nil {
+			_ = a.createSandboxDebugBundle(ctx, namespace, req.ScanID, response, topology)
+		}
+		return response, err
 	}
 
-	mockDNSIP, err := a.createExternalDependencyMock(ctx, namespace, req.ScanID)
+	mockDNSIP, err := a.createExternalDependencyMock(ctx, namespace, req.ScanID, nil)
 	if err != nil {
 		return SandboxResponse{}, err
 	}
@@ -80,10 +84,12 @@ func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (San
 
 	endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:80", serviceName, namespace)
 	log.Printf("[CreateSandbox] scan=%s sandbox ready endpoint=%s", req.ScanID, endpoint)
-	return SandboxResponse{
+	response := SandboxResponse{
 		Namespace: namespace,
 		Endpoint:  endpoint,
-	}, nil
+	}
+	_ = a.createSandboxDebugBundle(ctx, namespace, req.ScanID, response, nil)
+	return response, nil
 }
 
 func (a *Activities) DestroySandbox(ctx context.Context, scanID string) (string, error) {

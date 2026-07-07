@@ -414,7 +414,7 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	if mockDeployment == nil {
 		t.Fatalf("external dependency mock deployment was not created")
 	}
-	if len(mockDeployment.Spec.Template.Spec.Containers) != 2 {
+	if len(mockDeployment.Spec.Template.Spec.Containers) != 3 {
 		t.Fatalf("expected HTTP and DNS mock containers: %#v", mockDeployment.Spec.Template.Spec.Containers)
 	}
 	mockConfig, err := k8s.CoreV1().ConfigMaps(namespace).Get(ctx, externalMockName, metav1.GetOptions{})
@@ -1365,4 +1365,79 @@ func TestRun_TemporalConnectionFailureAndSuccess(t *testing.T) {
 			t.Fatalf("expected cancelled error, got %v", err)
 		}
 	})
+}
+
+func TestSeedTargetDatabasesCreatesAnonymizedSeedJob(t *testing.T) {
+	ctx := context.Background()
+	k8s := fake.NewSimpleClientset(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "aegis-war-room-scan-1"}})
+	activities := NewActivities(k8s)
+
+	response, err := activities.SeedTargetDatabases(ctx, SeedDatabaseRequest{
+		ScanID: "scan-1",
+		DatabaseSchemas: []DatabaseSchema{{
+			Engine:       "postgresql",
+			Host:         "postgres.aegis-war-room-scan-1.svc.cluster.local",
+			Port:         5432,
+			DatabaseName: "app",
+			Username:     "app_user",
+			Password:     "real-password",
+		}},
+		RestoreSQL: "INSERT INTO users(email, full_name, password, api_key) VALUES ('john.doe@example.com', 'John Doe', 'real-password', 'sk_live_realSecret');",
+	})
+	if err != nil {
+		t.Fatalf("SeedTargetDatabases returned error: %v", err)
+	}
+	if !response.Anonymized || response.SeededCount != 1 {
+		t.Fatalf("unexpected seed response: %#v", response)
+	}
+	configMap, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, "db-seed-app-sql", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected seed configmap: %v", err)
+	}
+	seedSQL := configMap.Data["seed.sql"]
+	for _, forbidden := range []string{"john.doe@example.com", "John Doe", "sk_live_realSecret"} {
+		if strings.Contains(seedSQL, forbidden) {
+			t.Fatalf("seed SQL leaked %q: %s", forbidden, seedSQL)
+		}
+	}
+	if !strings.Contains(seedSQL, "user@example.test") || !strings.Contains(seedSQL, "PRENOM_1 NOM_1") {
+		t.Fatalf("seed SQL was not anonymized as expected: %s", seedSQL)
+	}
+	job, err := k8s.BatchV1().Jobs("aegis-war-room-scan-1").Get(ctx, "db-seed-app", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected seed job: %v", err)
+	}
+	if job.Spec.Template.Spec.Containers[0].Env[0].Name != "PGHOST" {
+		t.Fatalf("expected psql env vars, got %#v", job.Spec.Template.Spec.Containers[0].Env)
+	}
+}
+
+func TestCreateSandboxConfiguresExternalMockScenariosAndDebugBundle(t *testing.T) {
+	ctx := context.Background()
+	previousTimeout := topologyDeploymentReadyTimeout
+	topologyDeploymentReadyTimeout = time.Millisecond
+	defer func() { topologyDeploymentReadyTimeout = previousTimeout }()
+	k8s := fake.NewSimpleClientset()
+	activities := NewActivities(k8s)
+
+	_, err := activities.CreateSandbox(ctx, SandboxRequest{
+		ScanID:       "scan-1",
+		TopologyJSON: `{"containers":[{"name":"web","image":"nginx","ports":[{"number":80}]}],"externalMocks":[{"host":"api.stripe.com","routes":[{"method":"POST","path":"/oauth/token","status":201,"body":"{\"token\":\"mock\"}"}]}]}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox returned error: %v", err)
+	}
+	mockConfig, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, externalMockName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected external mock configmap: %v", err)
+	}
+	if !strings.Contains(mockConfig.Data["default.conf"], "location = /oauth/token") || !strings.Contains(mockConfig.Data["default.conf"], "api.stripe.com") {
+		t.Fatalf("expected scripted external mock route, got %s", mockConfig.Data["default.conf"])
+	}
+	if _, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, sandboxDebugBundleName("scan-1"), metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected debug bundle configmap: %v", err)
+	}
+	if _, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, externalMockTrafficConfigMapName("scan-1"), metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected traffic bundle configmap: %v", err)
+	}
 }

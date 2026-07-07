@@ -45,6 +45,21 @@ func (t *SandboxTopology) validate() error {
 	if len(workloads) == 0 {
 		return errors.New("topology must contain at least one service, deployment, or container")
 	}
+	for i, mock := range t.ExternalMocks {
+		if strings.TrimSpace(mock.Host) == "" {
+			return fmt.Errorf("topology external_mock %d host is required", i)
+		}
+		for routeIndex, route := range mock.Routes {
+			if route.Status < 0 || route.Status > 599 {
+				return fmt.Errorf("topology external_mock %q route %d status is invalid", mock.Host, routeIndex)
+			}
+		}
+	}
+	for i, schema := range t.DatabaseSchemas {
+		if strings.TrimSpace(schema.Engine) == "" {
+			return fmt.Errorf("topology database_schema %d engine is required", i)
+		}
+	}
 	seen := map[string]struct{}{}
 	for i, workload := range workloads {
 		name := strings.TrimSpace(workload.Name)
@@ -77,6 +92,40 @@ func (t *SandboxTopology) validate() error {
 	}
 	if _, err := orderedTopologyWorkloads(workloads); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (t *SandboxTopology) UnmarshalJSON(data []byte) error {
+	var alias sandboxTopologyAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	*t = SandboxTopology{
+		Services:        alias.Services,
+		Deployments:     alias.Deployments,
+		Containers:      alias.Containers,
+		ExternalMocks:   append(alias.ExternalMocks, alias.ExternalMocksCamel...),
+		DatabaseSchemas: append(alias.DatabaseSchemas, alias.DatabaseSchemasCamel...),
+	}
+	return nil
+}
+
+func (s *DatabaseSchema) UnmarshalJSON(data []byte) error {
+	var alias databaseSchemaAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	*s = DatabaseSchema{
+		Engine:              strings.TrimSpace(alias.Engine),
+		Host:                strings.TrimSpace(alias.Host),
+		Port:                alias.Port,
+		DatabaseName:        firstNonEmpty(alias.DatabaseName, alias.DatabaseNameCamel),
+		Username:            strings.TrimSpace(alias.Username),
+		Password:            alias.Password,
+		SourceContainerID:   firstNonEmpty(alias.SourceContainerID, alias.SourceContainerIDCamel),
+		SourceContainerName: firstNonEmpty(alias.SourceContainerName, alias.SourceContainerNameCamel),
+		Tables:              alias.Tables,
 	}
 	return nil
 }
@@ -275,7 +324,7 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 	if len(workloads) == 0 {
 		return SandboxResponse{}, errors.New("topology does not contain any workload")
 	}
-	mockDNSIP, err := a.createExternalDependencyMock(ctx, namespace, scanID)
+	mockDNSIP, err := a.createExternalDependencyMock(ctx, namespace, scanID, topology.ExternalMocks)
 	if err != nil {
 		return SandboxResponse{}, err
 	}

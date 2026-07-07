@@ -68,6 +68,7 @@ func Run(ctx context.Context) error {
 	activities := NewActivities(k8s)
 	w.RegisterActivityWithOptions(activities.CreateSandbox, activity.RegisterOptions{Name: "CreateSandbox"})
 	w.RegisterActivityWithOptions(activities.DestroySandbox, activity.RegisterOptions{Name: "DestroySandbox"})
+	w.RegisterActivityWithOptions(activities.SeedTargetDatabases, activity.RegisterOptions{Name: "SeedTargetDatabases"})
 
 	log.Printf("Aegis AI Worker Deployer listening on queue %s", getenv("DEPLOYER_TASK_QUEUE", defaultTaskQueue))
 	return w.Run(worker.InterruptCh())

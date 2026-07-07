@@ -42,9 +42,83 @@ type SandboxDeploymentSummary struct {
 }
 
 type SandboxTopology struct {
-	Services    []TopologyWorkload `json:"services,omitempty"`
-	Deployments []TopologyWorkload `json:"deployments,omitempty"`
-	Containers  []TopologyWorkload `json:"containers,omitempty"`
+	Services        []TopologyWorkload     `json:"services,omitempty"`
+	Deployments     []TopologyWorkload     `json:"deployments,omitempty"`
+	Containers      []TopologyWorkload     `json:"containers,omitempty"`
+	ExternalMocks   []ExternalMockScenario `json:"external_mocks,omitempty"`
+	DatabaseSchemas []DatabaseSchema       `json:"database_schemas,omitempty"`
+}
+
+type ExternalMockScenario struct {
+	Host    string              `json:"host,omitempty"`
+	Routes  []ExternalMockRoute `json:"routes,omitempty"`
+	Capture bool                `json:"capture,omitempty"`
+}
+
+type ExternalMockRoute struct {
+	Method  string            `json:"method,omitempty"`
+	Path    string            `json:"path,omitempty"`
+	Status  int               `json:"status,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    string            `json:"body,omitempty"`
+	Latency string            `json:"latency,omitempty"`
+}
+
+type DatabaseSchema struct {
+	Engine              string          `json:"engine,omitempty"`
+	Host                string          `json:"host,omitempty"`
+	Port                int32           `json:"port,omitempty"`
+	DatabaseName        string          `json:"database_name,omitempty"`
+	Username            string          `json:"username,omitempty"`
+	Password            string          `json:"password,omitempty"`
+	SourceContainerID   string          `json:"source_container_id,omitempty"`
+	SourceContainerName string          `json:"source_container_name,omitempty"`
+	Tables              []DatabaseTable `json:"tables,omitempty"`
+}
+
+type DatabaseTable struct {
+	Name        string               `json:"name,omitempty"`
+	Columns     []DatabaseColumn     `json:"columns,omitempty"`
+	Indexes     []DatabaseIndex      `json:"indexes,omitempty"`
+	ForeignKeys []DatabaseForeignKey `json:"foreign_keys,omitempty"`
+}
+
+type DatabaseColumn struct {
+	Name         string `json:"name,omitempty"`
+	DataType     string `json:"data_type,omitempty"`
+	Nullable     bool   `json:"nullable,omitempty"`
+	PrimaryKey   bool   `json:"primary_key,omitempty"`
+	DefaultValue string `json:"default_value,omitempty"`
+}
+
+type DatabaseIndex struct {
+	Name    string   `json:"name,omitempty"`
+	Columns []string `json:"columns,omitempty"`
+	Unique  bool     `json:"unique,omitempty"`
+}
+
+type DatabaseForeignKey struct {
+	Name              string   `json:"name,omitempty"`
+	Columns           []string `json:"columns,omitempty"`
+	ReferencedTable   string   `json:"referenced_table,omitempty"`
+	ReferencedColumns []string `json:"referenced_columns,omitempty"`
+}
+
+type SeedDatabaseRequest struct {
+	ScanID          string           `json:"scan_id"`
+	DatabaseSchemas []DatabaseSchema `json:"database_schemas,omitempty"`
+	RestoreSQL      string           `json:"restore_sql,omitempty"`
+	SeedFlag        string           `json:"seed_flag,omitempty"`
+}
+
+type SeedDatabaseResponse struct {
+	Namespace     string   `json:"namespace"`
+	Seeded        []string `json:"seeded"`
+	SeededCount   int      `json:"seeded_count"`
+	SeedFlag      string   `json:"seed_flag"`
+	Anonymized    bool     `json:"anonymized"`
+	DebugBundle   string   `json:"debug_bundle,omitempty"`
+	TrafficBundle string   `json:"traffic_bundle,omitempty"`
 }
 
 type TopologyWorkload struct {
@@ -132,6 +206,31 @@ type topologyWorkloadAlias struct {
 	PodSecurityContext *corev1.PodSecurityContext  `json:"pod_security_context,omitempty"`
 	Stateful           bool                        `json:"stateful,omitempty"`
 	Service            TopologyService             `json:"service,omitempty"`
+}
+
+type sandboxTopologyAlias struct {
+	Services             []TopologyWorkload     `json:"services,omitempty"`
+	Deployments          []TopologyWorkload     `json:"deployments,omitempty"`
+	Containers           []TopologyWorkload     `json:"containers,omitempty"`
+	ExternalMocks        []ExternalMockScenario `json:"external_mocks,omitempty"`
+	ExternalMocksCamel   []ExternalMockScenario `json:"externalMocks,omitempty"`
+	DatabaseSchemas      []DatabaseSchema       `json:"database_schemas,omitempty"`
+	DatabaseSchemasCamel []DatabaseSchema       `json:"databaseSchemas,omitempty"`
+}
+
+type databaseSchemaAlias struct {
+	Engine                   string          `json:"engine,omitempty"`
+	Host                     string          `json:"host,omitempty"`
+	Port                     int32           `json:"port,omitempty"`
+	DatabaseName             string          `json:"database_name,omitempty"`
+	DatabaseNameCamel        string          `json:"databaseName,omitempty"`
+	Username                 string          `json:"username,omitempty"`
+	Password                 string          `json:"password,omitempty"`
+	SourceContainerID        string          `json:"source_container_id,omitempty"`
+	SourceContainerIDCamel   string          `json:"sourceContainerId,omitempty"`
+	SourceContainerName      string          `json:"source_container_name,omitempty"`
+	SourceContainerNameCamel string          `json:"sourceContainerName,omitempty"`
+	Tables                   []DatabaseTable `json:"tables,omitempty"`
 }
 
 type Activities struct {
