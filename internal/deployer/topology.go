@@ -651,8 +651,17 @@ func importTopologyImageArchive(ctx context.Context, workload TopologyWorkload) 
 		return fmt.Errorf("create image archive temp file: %w", err)
 	}
 	archivePath := file.Name()
-	defer os.Remove(archivePath)
-	defer file.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			if err := file.Close(); err != nil {
+				log.Printf("[CreateSandbox] close image archive temp file %s: %v", archivePath, err)
+			}
+		}
+		if err := os.Remove(archivePath); err != nil {
+			log.Printf("[CreateSandbox] remove image archive temp file %s: %v", archivePath, err)
+		}
+	}()
 
 	if err := downloadImageArchive(ctx, objectRef, file); err != nil {
 		return err
@@ -660,6 +669,7 @@ func importTopologyImageArchive(ctx context.Context, workload TopologyWorkload) 
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("write image archive %s: %w", objectRef, err)
 	}
+	closed = true
 
 	command := strings.TrimSpace(os.Getenv("AEGIS_IMAGE_IMPORT_COMMAND"))
 	if command == "" {
@@ -686,7 +696,11 @@ func downloadImageArchive(ctx context.Context, ref string, file *os.File) error 
 		if err != nil {
 			return fmt.Errorf("download image archive %s: %w", ref, err)
 		}
-		defer response.Body.Close()
+		defer func() {
+			if err := response.Body.Close(); err != nil {
+				log.Printf("[CreateSandbox] close image archive response body: %v", err)
+			}
+		}()
 		if response.StatusCode < 200 || response.StatusCode > 299 {
 			return fmt.Errorf("download image archive %s returned HTTP %d", ref, response.StatusCode)
 		}
@@ -719,7 +733,11 @@ func downloadImageArchive(ctx context.Context, ref string, file *os.File) error 
 	if err != nil {
 		return fmt.Errorf("download image archive %s: %w", ref, err)
 	}
-	defer objectReader.Close()
+	defer func() {
+		if err := objectReader.Close(); err != nil {
+			log.Printf("[CreateSandbox] close image archive object reader: %v", err)
+		}
+	}()
 	if _, err := io.Copy(file, objectReader); err != nil {
 		return fmt.Errorf("write image archive %s: %w", ref, err)
 	}
