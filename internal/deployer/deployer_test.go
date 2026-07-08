@@ -441,6 +441,9 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	if len(httpContainer.Args) != 1 || !strings.Contains(httpContainer.Args[0], "openssl req -x509") {
 		t.Fatalf("expected mock TLS material to be generated at startup, got %#v", httpContainer.Args)
 	}
+	if !strings.Contains(httpContainer.Args[0], "/usr/local/openresty/bin/openresty -g 'daemon off;'") {
+		t.Fatalf("expected mock to start OpenResty with absolute path, got %#v", httpContainer.Args)
+	}
 
 	apiDeployment := createdDeployments["api"]
 	if apiDeployment == nil {
@@ -854,7 +857,7 @@ func TestCreateSandboxHonorsPreferredTopologyEndpoint(t *testing.T) {
 	}
 }
 
-func TestCreateSandboxExposesPreferredTopologyEndpointWhenNotReady(t *testing.T) {
+func TestCreateSandboxFallsBackWhenPreferredTopologyEndpointIsNotReady(t *testing.T) {
 	ctx := context.Background()
 	namespace := "aegis-war-room-scan-1"
 	k8s := fake.NewSimpleClientset()
@@ -907,10 +910,10 @@ func TestCreateSandboxExposesPreferredTopologyEndpointWhenNotReady(t *testing.T)
 	if err != nil {
 		t.Fatalf("CreateSandbox returned error: %v", err)
 	}
-	if response.EndpointWorkload != "broken-app" {
+	if response.EndpointWorkload != "ready-api" {
 		t.Fatalf("unexpected endpoint workload: %s", response.EndpointWorkload)
 	}
-	if response.Endpoint != "http://broken-app.aegis-war-room-scan-1.svc.cluster.local:8080" {
+	if response.Endpoint != "http://ready-api.aegis-war-room-scan-1.svc.cluster.local:9090" {
 		t.Fatalf("unexpected endpoint: %s", response.Endpoint)
 	}
 	status, ok := findWorkloadStatus(response.Workloads, "broken-app")

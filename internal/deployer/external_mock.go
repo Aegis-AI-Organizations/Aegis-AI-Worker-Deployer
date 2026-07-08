@@ -421,7 +421,7 @@ func (a *Activities) createExternalMockDeployment(ctx context.Context, namespace
 									"-keyout /etc/nginx/mock-tls/tls.key " +
 									"-out /etc/nginx/mock-tls/tls.crt " +
 									"-days 1 -subj /CN=external-api-mock >/dev/null 2>&1 && " +
-									"openresty -g 'daemon off;'",
+									"/usr/local/openresty/bin/openresty -g 'daemon off;'",
 							},
 							Ports: []corev1.ContainerPort{{
 								Name:          "http",

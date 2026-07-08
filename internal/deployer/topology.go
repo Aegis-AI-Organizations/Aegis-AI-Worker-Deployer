@@ -454,17 +454,29 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 				Summary:   summarizeSandboxWorkloads(len(workloads), statuses, false),
 			}, fmt.Errorf("preferred endpoint workload %q does not expose any port", preferredEndpointWorkload)
 		}
-		if preferredStatus.Status != "ready" {
+		if preferredStatus.Status == "ready" {
+			endpointServiceName = preferredEndpointWorkload
+			endpointPort = preferredPorts[0].servicePort()
+		} else if endpointServiceName != "" {
 			log.Printf(
-				"[CreateSandbox] scan=%s preferred endpoint workload %q is %s; exposing endpoint anyway: %s",
+				"[CreateSandbox] scan=%s preferred endpoint workload %q is %s; falling back to ready workload %q: %s",
+				scanID,
+				preferredEndpointWorkload,
+				preferredStatus.Status,
+				endpointServiceName,
+				strings.TrimSpace(preferredStatus.Error),
+			)
+		} else {
+			log.Printf(
+				"[CreateSandbox] scan=%s preferred endpoint workload %q is %s and no ready fallback exists; exposing endpoint anyway: %s",
 				scanID,
 				preferredEndpointWorkload,
 				preferredStatus.Status,
 				strings.TrimSpace(preferredStatus.Error),
 			)
+			endpointServiceName = preferredEndpointWorkload
+			endpointPort = preferredPorts[0].servicePort()
 		}
-		endpointServiceName = preferredEndpointWorkload
-		endpointPort = preferredPorts[0].servicePort()
 	}
 	if endpointServiceName == "" {
 		endpointServiceName = firstServiceName
