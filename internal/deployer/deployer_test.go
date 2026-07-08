@@ -3,6 +3,8 @@ package deployer
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -1213,6 +1215,94 @@ func TestParseTopologyValidatesTypingAndCollisions(t *testing.T) {
 			t.Fatalf("expected dependency cycle error, got %v", err)
 		}
 	})
+}
+
+func TestImageArchiveObjectParsesReferences(t *testing.T) {
+	t.Setenv("MINIO_INGEST_BUCKET", "ingest-bucket")
+
+	tests := []struct {
+		name       string
+		ref        string
+		wantBucket string
+		wantObject string
+		wantErr    bool
+	}{
+		{name: "short minio ref", ref: "minio:company/images/web.tar", wantBucket: "ingest-bucket", wantObject: "company/images/web.tar"},
+		{name: "s3 ref", ref: "s3://custom-bucket/images/web.tar", wantBucket: "custom-bucket", wantObject: "images/web.tar"},
+		{name: "bare object", ref: "company/images/api.tar", wantBucket: "ingest-bucket", wantObject: "company/images/api.tar"},
+		{name: "invalid s3 ref", ref: "s3://missing-object", wantErr: true},
+		{name: "empty ref", ref: " ", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bucket, object, err := imageArchiveObject(tc.ref)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("imageArchiveObject returned error: %v", err)
+			}
+			if bucket != tc.wantBucket || object != tc.wantObject {
+				t.Fatalf("unexpected archive object bucket=%q object=%q", bucket, object)
+			}
+		})
+	}
+}
+
+func TestDownloadImageArchiveFromHTTP(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/image.tar" {
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte("archive-bytes"))
+	}))
+	defer server.Close()
+
+	file, err := os.CreateTemp("", "aegis-image-test-*.tar")
+	if err != nil {
+		t.Fatalf("CreateTemp returned error: %v", err)
+	}
+	path := file.Name()
+	t.Cleanup(func() {
+		_ = file.Close()
+		_ = os.Remove(path)
+	})
+
+	if err := downloadImageArchive(context.Background(), server.URL+"/image.tar", file); err != nil {
+		t.Fatalf("downloadImageArchive returned error: %v", err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if string(content) != "archive-bytes" {
+		t.Fatalf("unexpected archive content: %q", content)
+	}
+}
+
+func TestImportTopologyImageArchivesDeduplicatesHTTPArchives(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_, _ = w.Write([]byte("archive-bytes"))
+	}))
+	defer server.Close()
+	t.Setenv("AEGIS_IMAGE_IMPORT_COMMAND", "test -s {archive}")
+
+	workloads := []TopologyWorkload{
+		{Name: "api", Image: "local-api:latest", ImageArchiveRef: server.URL + "/image.tar"},
+		{Name: "api-copy", Image: "local-api:latest", ImageArchiveRef: server.URL + "/image.tar"},
+	}
+	if err := importTopologyImageArchives(context.Background(), workloads); err != nil {
+		t.Fatalf("importTopologyImageArchives returned error: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("expected one archive download, got %d", requests)
+	}
 }
 
 func TestCreateSandboxDoesNotReadNamespaces(t *testing.T) {
