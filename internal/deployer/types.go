@@ -136,6 +136,8 @@ type TopologyWorkload struct {
 	ID                 string                      `json:"id,omitempty"`
 	Name               string                      `json:"name"`
 	Image              string                      `json:"image"`
+	ImageArchiveRef    string                      `json:"image_archive_ref,omitempty"`
+	ImageArchiveObject string                      `json:"image_archive_object,omitempty"`
 	Ports              []TopologyPort              `json:"ports,omitempty"`
 	Env                map[string]string           `json:"env,omitempty"`
 	Replicas           *int32                      `json:"replicas,omitempty"`
@@ -193,30 +195,34 @@ type TopologyPort struct {
 }
 
 type topologyWorkloadAlias struct {
-	ID                 string                      `json:"id,omitempty"`
-	Name               string                      `json:"name"`
-	Image              string                      `json:"image"`
-	Ports              []TopologyPort              `json:"ports,omitempty"`
-	Env                json.RawMessage             `json:"env,omitempty"`
-	EnvVars            json.RawMessage             `json:"env_vars,omitempty"`
-	Replicas           *int32                      `json:"replicas,omitempty"`
-	Liveness           json.RawMessage             `json:"liveness_probe,omitempty"`
-	LivenessCamel      json.RawMessage             `json:"livenessProbe,omitempty"`
-	DependsOn          []string                    `json:"depends_on,omitempty"`
-	WaitFor            []string                    `json:"wait_for,omitempty"`
-	Required           *bool                       `json:"required,omitempty"`
-	Command            []string                    `json:"command,omitempty"`
-	Args               []string                    `json:"args,omitempty"`
-	WorkingDir         string                      `json:"working_dir,omitempty"`
-	InitContainers     []TopologyInitContainer     `json:"init_containers,omitempty"`
-	ConfigFiles        []TopologyFile              `json:"config_files,omitempty"`
-	SecretFiles        []TopologyFile              `json:"secret_files,omitempty"`
-	EmptyDirs          []TopologyEmptyDir          `json:"empty_dirs,omitempty"`
-	Resources          corev1.ResourceRequirements `json:"resources,omitempty"`
-	SecurityContext    *corev1.SecurityContext     `json:"security_context,omitempty"`
-	PodSecurityContext *corev1.PodSecurityContext  `json:"pod_security_context,omitempty"`
-	Stateful           bool                        `json:"stateful,omitempty"`
-	Service            TopologyService             `json:"service,omitempty"`
+	ID                      string                      `json:"id,omitempty"`
+	Name                    string                      `json:"name"`
+	Image                   string                      `json:"image"`
+	ImageArchiveRef         string                      `json:"image_archive_ref,omitempty"`
+	ImageArchiveRefCamel    string                      `json:"imageArchiveRef,omitempty"`
+	ImageArchiveObject      string                      `json:"image_archive_object,omitempty"`
+	ImageArchiveObjectCamel string                      `json:"imageArchiveObject,omitempty"`
+	Ports                   []TopologyPort              `json:"ports,omitempty"`
+	Env                     json.RawMessage             `json:"env,omitempty"`
+	EnvVars                 json.RawMessage             `json:"env_vars,omitempty"`
+	Replicas                *int32                      `json:"replicas,omitempty"`
+	Liveness                json.RawMessage             `json:"liveness_probe,omitempty"`
+	LivenessCamel           json.RawMessage             `json:"livenessProbe,omitempty"`
+	DependsOn               []string                    `json:"depends_on,omitempty"`
+	WaitFor                 []string                    `json:"wait_for,omitempty"`
+	Required                *bool                       `json:"required,omitempty"`
+	Command                 []string                    `json:"command,omitempty"`
+	Args                    []string                    `json:"args,omitempty"`
+	WorkingDir              string                      `json:"working_dir,omitempty"`
+	InitContainers          []TopologyInitContainer     `json:"init_containers,omitempty"`
+	ConfigFiles             []TopologyFile              `json:"config_files,omitempty"`
+	SecretFiles             []TopologyFile              `json:"secret_files,omitempty"`
+	EmptyDirs               []TopologyEmptyDir          `json:"empty_dirs,omitempty"`
+	Resources               corev1.ResourceRequirements `json:"resources,omitempty"`
+	SecurityContext         *corev1.SecurityContext     `json:"security_context,omitempty"`
+	PodSecurityContext      *corev1.PodSecurityContext  `json:"pod_security_context,omitempty"`
+	Stateful                bool                        `json:"stateful,omitempty"`
+	Service                 TopologyService             `json:"service,omitempty"`
 }
 
 type sandboxTopologyAlias struct {

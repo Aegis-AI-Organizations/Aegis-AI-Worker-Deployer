@@ -6,12 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
+	"net/http"
+	"os"
+	"os/exec"
 	"path"
 	"strings"
 	"time"
 	"unicode"
 
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -210,6 +216,8 @@ func (w *TopologyWorkload) UnmarshalJSON(data []byte) error {
 		ID:                 strings.TrimSpace(alias.ID),
 		Name:               strings.TrimSpace(alias.Name),
 		Image:              strings.TrimSpace(alias.Image),
+		ImageArchiveRef:    firstNonEmpty(alias.ImageArchiveRef, alias.ImageArchiveRefCamel),
+		ImageArchiveObject: firstNonEmpty(alias.ImageArchiveObject, alias.ImageArchiveObjectCamel),
 		Ports:              alias.Ports,
 		Env:                env,
 		Replicas:           alias.Replicas,
@@ -336,6 +344,9 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 		preferredEndpointWorkload = kubernetesName(preferredEndpointWorkload)
 	}
 	mockSecret := mockTopologySecret(scanID)
+	if err := importTopologyImageArchives(ctx, orderedWorkloads); err != nil {
+		return SandboxResponse{}, err
+	}
 	firstServiceName := kubernetesName(workloads[0].Name)
 	firstReadyServiceName := ""
 	firstReadyServicePort := int32(0)
@@ -610,6 +621,136 @@ func isValidEnvName(key string) bool {
 		}
 	}
 	return key != ""
+}
+
+func importTopologyImageArchives(ctx context.Context, workloads []TopologyWorkload) error {
+	imported := map[string]struct{}{}
+	for _, workload := range workloads {
+		archiveRef := strings.TrimSpace(firstNonEmpty(workload.ImageArchiveRef, workload.ImageArchiveObject))
+		if archiveRef == "" {
+			continue
+		}
+		if _, ok := imported[archiveRef]; ok {
+			continue
+		}
+		if err := importTopologyImageArchive(ctx, workload); err != nil {
+			return err
+		}
+		imported[archiveRef] = struct{}{}
+	}
+	return nil
+}
+
+func importTopologyImageArchive(ctx context.Context, workload TopologyWorkload) error {
+	objectRef := strings.TrimSpace(firstNonEmpty(workload.ImageArchiveRef, workload.ImageArchiveObject))
+	if objectRef == "" {
+		return nil
+	}
+	file, err := os.CreateTemp("", "aegis-image-*.tar")
+	if err != nil {
+		return fmt.Errorf("create image archive temp file: %w", err)
+	}
+	archivePath := file.Name()
+	defer os.Remove(archivePath)
+	defer file.Close()
+
+	if err := downloadImageArchive(ctx, objectRef, file); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("write image archive %s: %w", objectRef, err)
+	}
+
+	command := strings.TrimSpace(os.Getenv("AEGIS_IMAGE_IMPORT_COMMAND"))
+	if command == "" {
+		command = "docker load -i {archive}"
+	}
+	command = strings.ReplaceAll(command, "{archive}", archivePath)
+	command = strings.ReplaceAll(command, "{image}", strings.TrimSpace(workload.Image))
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("import image archive for %s: %w: %s", workload.Image, err, strings.TrimSpace(string(output)))
+	}
+	log.Printf("[CreateSandbox] imported image archive for workload=%s image=%s", workload.Name, workload.Image)
+	return nil
+}
+
+func downloadImageArchive(ctx context.Context, ref string, file *os.File) error {
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, ref, nil)
+		if err != nil {
+			return fmt.Errorf("build image archive request: %w", err)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return fmt.Errorf("download image archive %s: %w", ref, err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode < 200 || response.StatusCode > 299 {
+			return fmt.Errorf("download image archive %s returned HTTP %d", ref, response.StatusCode)
+		}
+		_, err = io.Copy(file, response.Body)
+		return err
+	}
+
+	bucket, object, err := imageArchiveObject(ref)
+	if err != nil {
+		return err
+	}
+	endpoint := strings.TrimSpace(os.Getenv("MINIO_ENDPOINT"))
+	if endpoint == "" {
+		return errors.New("MINIO_ENDPOINT is required to import image archives")
+	}
+	secure := strings.EqualFold(os.Getenv("MINIO_SECURE"), "true")
+	endpoint = strings.TrimPrefix(strings.TrimPrefix(endpoint, "http://"), "https://")
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds: credentials.NewStaticV4(
+			os.Getenv("MINIO_ACCESS_KEY"),
+			os.Getenv("MINIO_SECRET_KEY"),
+			"",
+		),
+		Secure: secure,
+	})
+	if err != nil {
+		return fmt.Errorf("create MinIO client: %w", err)
+	}
+	objectReader, err := client.GetObject(ctx, bucket, object, minio.GetObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("download image archive %s: %w", ref, err)
+	}
+	defer objectReader.Close()
+	if _, err := io.Copy(file, objectReader); err != nil {
+		return fmt.Errorf("write image archive %s: %w", ref, err)
+	}
+	return nil
+}
+
+func imageArchiveObject(ref string) (string, string, error) {
+	ref = strings.TrimSpace(ref)
+	bucket := strings.TrimSpace(os.Getenv("MINIO_INGEST_BUCKET"))
+	if bucket == "" {
+		bucket = strings.TrimSpace(os.Getenv("MINIO_BUCKET"))
+	}
+	if bucket == "" {
+		bucket = "aegis-ingest"
+	}
+	object := ref
+	if strings.HasPrefix(ref, "minio://") || strings.HasPrefix(ref, "s3://") {
+		trimmed := strings.TrimPrefix(strings.TrimPrefix(ref, "minio://"), "s3://")
+		parts := strings.SplitN(trimmed, "/", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			return "", "", fmt.Errorf("invalid image archive reference %q", ref)
+		}
+		bucket = strings.TrimSpace(parts[0])
+		object = strings.TrimSpace(parts[1])
+	} else if strings.HasPrefix(ref, "minio:") {
+		object = strings.TrimLeft(strings.TrimSpace(strings.TrimPrefix(ref, "minio:")), "/")
+	}
+	if strings.TrimSpace(object) == "" {
+		return "", "", fmt.Errorf("invalid image archive reference %q", ref)
+	}
+	return bucket, object, nil
 }
 
 func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, name string, workload TopologyWorkload, mockDNSIP string) error {
