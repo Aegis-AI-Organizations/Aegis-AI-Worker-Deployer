@@ -1,11 +1,15 @@
 package deployer
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"sort"
 	"strings"
+	"text/template"
+	"time"
+	"unicode"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -118,33 +122,119 @@ func (a *Activities) createExternalMockConfigMap(ctx context.Context, namespace,
 }
 
 func externalMockNginxConfig(scenarios []ExternalMockScenario) string {
-	locations := externalMockLocations(scenarios)
-	return fmt.Sprintf(`log_format aegis escape=json '{"timestamp":"$time_iso8601","host":"$host","method":"$request_method","path":"$request_uri","status":$status,"request_id":"$request_id"}';
+	data := struct {
+		HTTPPort  int32
+		HTTPSPort int32
+		Locations []externalMockLocation
+	}{
+		HTTPPort:  externalMockHTTPPort,
+		HTTPSPort: externalMockHTTPSPort,
+		Locations: externalMockLocations(scenarios),
+	}
+	var rendered bytes.Buffer
+	if err := externalMockNginxTemplate.Execute(&rendered, data); err != nil {
+		log.Printf("[CreateSandbox] failed to render external mock nginx config: %v", err)
+		return externalMockFallbackNginxConfig()
+	}
+	return rendered.String()
+}
+
+var externalMockNginxTemplate = template.Must(template.New("external-mock-nginx").Parse(`events {}
+http {
+log_format aegis escape=json '{"timestamp":"$time_iso8601","host":"$host","method":"$request_method","path":"$request_uri","status":$status,"request_id":"$request_id"}';
 server {
-    listen %d default_server;
+    listen {{ .HTTPPort }} default_server;
     access_log /var/log/aegis/traffic.log aegis;
-%s
+{{ template "locations" .Locations }}
     location / {
         add_header Content-Type text/plain;
         return 200 '';
     }
 }
 
+server {
+    listen {{ .HTTPSPort }} ssl default_server;
+    access_log /var/log/aegis/traffic.log aegis;
+    ssl_certificate /etc/nginx/mock-tls/tls.crt;
+    ssl_certificate_key /etc/nginx/mock-tls/tls.key;
+{{ template "locations" .Locations }}
+    location / {
+        add_header Content-Type text/plain;
+        return 200 '';
+    }
+}
+
+}
+
+{{ define "locations" -}}
+{{ range . }}
+    location = {{ .Path }} {
+        default_type application/json;
+        content_by_lua_block {
+{{- if .Host }}
+            if ngx.var.host ~= {{ .Host }} then
+                ngx.status = 404
+                ngx.print("")
+                return
+            end
+{{- end }}
+{{- if .Method }}
+            if ngx.var.request_method ~= {{ .Method }} then
+                ngx.status = 405
+                ngx.print("")
+                return
+            end
+{{- end }}
+{{- if .LatencySeconds }}
+            ngx.sleep({{ .LatencySeconds }})
+{{- end }}
+{{- range .Headers }}
+            ngx.header[{{ .Name }}] = {{ .Value }}
+{{- end }}
+            ngx.status = {{ .Status }}
+            ngx.print({{ .Body }})
+        }
+    }
+{{ end -}}
+{{ end -}}
+`))
+
+func externalMockFallbackNginxConfig() string {
+	return fmt.Sprintf(`events {}
+http {
+log_format aegis escape=json '{"timestamp":"$time_iso8601","host":"$host","method":"$request_method","path":"$request_uri","status":$status,"request_id":"$request_id"}';
+server {
+    listen %d default_server;
+    access_log /var/log/aegis/traffic.log aegis;
+    location / { return 200 ''; }
+}
 server {
     listen %d ssl default_server;
     access_log /var/log/aegis/traffic.log aegis;
     ssl_certificate /etc/nginx/mock-tls/tls.crt;
     ssl_certificate_key /etc/nginx/mock-tls/tls.key;
-%s
-    location / {
-        add_header Content-Type text/plain;
-        return 200 '';
-    }
+    location / { return 200 ''; }
 }
-`, externalMockHTTPPort, locations, externalMockHTTPSPort, locations)
+}
+`, externalMockHTTPPort, externalMockHTTPSPort)
 }
 
-func externalMockLocations(scenarios []ExternalMockScenario) string {
+type externalMockHeader struct {
+	Name  string
+	Value string
+}
+
+type externalMockLocation struct {
+	Host           string
+	Path           string
+	Method         string
+	Status         int
+	Headers        []externalMockHeader
+	Body           string
+	LatencySeconds string
+}
+
+func externalMockLocations(scenarios []ExternalMockScenario) []externalMockLocation {
 	type routeEntry struct {
 		host, path, method string
 		route              ExternalMockRoute
@@ -157,35 +247,126 @@ func externalMockLocations(scenarios []ExternalMockScenario) string {
 			if path == "" {
 				path = "/"
 			}
-			entries = append(entries, routeEntry{host: host, path: path, method: strings.ToUpper(strings.TrimSpace(route.Method)), route: route})
+			entries = append(entries, routeEntry{host: host, path: normalizeNginxLocationPath(path), method: strings.ToUpper(strings.TrimSpace(route.Method)), route: route})
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].path > entries[j].path })
-	var builder strings.Builder
+	locations := make([]externalMockLocation, 0, len(entries))
 	for _, entry := range entries {
 		status := entry.route.Status
 		if status == 0 {
 			status = 200
 		}
-		body := strings.ReplaceAll(entry.route.Body, "'", "\\'")
+		body := entry.route.Body
 		if body == "" {
 			body = "{}"
 		}
-		fmt.Fprintf(&builder, "    location = %s {\n", entry.path)
-		if entry.host != "" {
-			fmt.Fprintf(&builder, "        if ($host != '%s') { return 404 ''; }\n", entry.host)
+		headers := make([]externalMockHeader, 0, len(entry.route.Headers))
+		headerKeys := make([]string, 0, len(entry.route.Headers))
+		for key := range entry.route.Headers {
+			headerKeys = append(headerKeys, key)
 		}
-		if entry.method != "" && entry.method != "*" {
-			fmt.Fprintf(&builder, "        if ($request_method != '%s') { return 405 ''; }\n", entry.method)
+		sort.Strings(headerKeys)
+		for _, key := range headerKeys {
+			headers = append(headers, externalMockHeader{Name: luaQuote(kubernetesHeaderName(key)), Value: luaQuote(entry.route.Headers[key])})
 		}
-		for key, value := range entry.route.Headers {
-			fmt.Fprintf(&builder, "        add_header %s '%s';\n", kubernetesName(key), strings.ReplaceAll(value, "'", "\\'"))
-		}
-		builder.WriteString("        add_header Content-Type application/json;\n")
-		fmt.Fprintf(&builder, "        return %d '%s';\n", status, body)
-		builder.WriteString("    }\n")
+		locations = append(locations, externalMockLocation{
+			Host:           optionalLuaQuote(entry.host),
+			Path:           entry.path,
+			Method:         optionalLuaQuote(entry.method),
+			Status:         status,
+			Headers:        headers,
+			Body:           luaQuote(body),
+			LatencySeconds: nginxLuaLatencySeconds(entry.route.Latency),
+		})
 	}
+	return locations
+}
+
+func normalizeNginxLocationPath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || !strings.HasPrefix(value, "/") {
+		return "/"
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.IsSpace(r) || strings.ContainsRune("{};\\'\"`", r) {
+			return "/"
+		}
+	}
+	return value
+}
+
+func kubernetesHeaderName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "X-Mock-Header"
+	}
+	var builder strings.Builder
+	lastHyphen := false
+	for _, r := range value {
+		valid := unicode.IsLetter(r) || unicode.IsDigit(r)
+		switch {
+		case valid:
+			builder.WriteRune(r)
+			lastHyphen = false
+		case !lastHyphen:
+			builder.WriteRune('-')
+			lastHyphen = true
+		}
+	}
+	name := strings.Trim(builder.String(), "-")
+	if name == "" {
+		return "X-Mock-Header"
+	}
+	return name
+}
+
+func optionalLuaQuote(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "*" {
+		return ""
+	}
+	return luaQuote(value)
+}
+
+func luaQuote(value string) string {
+	var builder strings.Builder
+	builder.WriteByte('"')
+	for _, b := range []byte(value) {
+		switch b {
+		case '\\':
+			builder.WriteString("\\\\")
+		case '"':
+			builder.WriteString("\\\"")
+		case '\n':
+			builder.WriteString("\\n")
+		case '\r':
+			builder.WriteString("\\r")
+		case '\t':
+			builder.WriteString("\\t")
+		default:
+			if b < 0x20 || b == 0x7f {
+				fmt.Fprintf(&builder, "\\%03d", b)
+			} else {
+				builder.WriteByte(b)
+			}
+		}
+	}
+	builder.WriteByte('"')
 	return builder.String()
+}
+
+func nginxLuaLatencySeconds(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		return ""
+	}
+	seconds := float64(duration) / float64(time.Second)
+	return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.6f", seconds), "0"), ".")
 }
 
 func externalMockScenariosJSON(scenarios []ExternalMockScenario) string {
@@ -231,7 +412,7 @@ func (a *Activities) createExternalMockDeployment(ctx context.Context, namespace
 					Containers: []corev1.Container{
 						{
 							Name:            "http",
-							Image:           "nginx:1.27-alpine",
+							Image:           "openresty/openresty:1.27.1.2-alpine",
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Command:         []string{"/bin/sh", "-c"},
 							Args: []string{
@@ -240,7 +421,7 @@ func (a *Activities) createExternalMockDeployment(ctx context.Context, namespace
 									"-keyout /etc/nginx/mock-tls/tls.key " +
 									"-out /etc/nginx/mock-tls/tls.crt " +
 									"-days 1 -subj /CN=external-api-mock >/dev/null 2>&1 && " +
-									"nginx -g 'daemon off;'",
+									"openresty -g 'daemon off;'",
 							},
 							Ports: []corev1.ContainerPort{{
 								Name:          "http",
@@ -254,7 +435,7 @@ func (a *Activities) createExternalMockDeployment(ctx context.Context, namespace
 							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:      "external-mock-config",
-									MountPath: "/etc/nginx/conf.d/default.conf",
+									MountPath: "/usr/local/openresty/nginx/conf/nginx.conf",
 									SubPath:   "default.conf",
 									ReadOnly:  true,
 								},

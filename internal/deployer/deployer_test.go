@@ -435,6 +435,9 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 		t.Fatalf("expected HTTPS mock to listen with TLS, got %q", mockConfig.Data["default.conf"])
 	}
 	httpContainer := mockDeployment.Spec.Template.Spec.Containers[0]
+	if !strings.Contains(httpContainer.Image, "openresty/openresty") {
+		t.Fatalf("expected OpenResty mock image for Lua latency support, got %q", httpContainer.Image)
+	}
 	if len(httpContainer.Args) != 1 || !strings.Contains(httpContainer.Args[0], "openssl req -x509") {
 		t.Fatalf("expected mock TLS material to be generated at startup, got %#v", httpContainer.Args)
 	}
@@ -1657,5 +1660,37 @@ func TestCreateSandboxConfiguresExternalMockScenariosAndDebugBundle(t *testing.T
 	}
 	if _, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, externalMockTrafficConfigMapName("scan-1"), metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected traffic bundle configmap: %v", err)
+	}
+}
+
+func TestExternalMockNginxConfigEscapesRoutePayloadAndAppliesLatency(t *testing.T) {
+	config := externalMockNginxConfig([]ExternalMockScenario{{
+		Host: "api.example.test",
+		Routes: []ExternalMockRoute{{
+			Method:  "POST",
+			Path:    "/v1/token",
+			Status:  202,
+			Latency: "250ms",
+			Headers: map[string]string{
+				"X-Trace-ID":      "trace-\"quoted\"",
+				"bad header ; {}": "kept safe",
+			},
+			Body: "{\"token\":\"mock-\\\"quoted\\\"\",\"lines\":\"one\\ntwo\"}",
+		}},
+	}})
+
+	for _, want := range []string{
+		"location = /v1/token",
+		"if ngx.var.host ~= \"api.example.test\" then",
+		"if ngx.var.request_method ~= \"POST\" then",
+		"ngx.sleep(0.25)",
+		"ngx.status = 202",
+		"ngx.header[\"X-Trace-ID\"] = \"trace-\\\"quoted\\\"\"",
+		"ngx.header[\"bad-header\"] = \"kept safe\"",
+		"ngx.print(\"{\\\"token\\\":\\\"mock-\\\\\\\"quoted\\\\\\\"\\\",\\\"lines\\\":\\\"one\\\\ntwo\\\"}\")",
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("expected config to contain %q, got %s", want, config)
+		}
 	}
 }
