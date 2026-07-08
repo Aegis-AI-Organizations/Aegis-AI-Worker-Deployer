@@ -45,8 +45,19 @@ type SandboxTopology struct {
 	Services        []TopologyWorkload     `json:"services,omitempty"`
 	Deployments     []TopologyWorkload     `json:"deployments,omitempty"`
 	Containers      []TopologyWorkload     `json:"containers,omitempty"`
+	Connections     []TopologyConnection   `json:"connections,omitempty"`
+	Routes          []TopologyConnection   `json:"routes,omitempty"`
 	ExternalMocks   []ExternalMockScenario `json:"external_mocks,omitempty"`
 	DatabaseSchemas []DatabaseSchema       `json:"database_schemas,omitempty"`
+}
+
+type TopologyConnection struct {
+	Source          string `json:"source,omitempty"`
+	SourceName      string `json:"source_name,omitempty"`
+	SourceNameCamel string `json:"sourceName,omitempty"`
+	Target          string `json:"target,omitempty"`
+	TargetName      string `json:"target_name,omitempty"`
+	TargetNameCamel string `json:"targetName,omitempty"`
 }
 
 type ExternalMockScenario struct {
@@ -212,6 +223,8 @@ type sandboxTopologyAlias struct {
 	Services             []TopologyWorkload     `json:"services,omitempty"`
 	Deployments          []TopologyWorkload     `json:"deployments,omitempty"`
 	Containers           []TopologyWorkload     `json:"containers,omitempty"`
+	Connections          []TopologyConnection   `json:"connections,omitempty"`
+	Routes               []TopologyConnection   `json:"routes,omitempty"`
 	ExternalMocks        []ExternalMockScenario `json:"external_mocks,omitempty"`
 	ExternalMocksCamel   []ExternalMockScenario `json:"externalMocks,omitempty"`
 	DatabaseSchemas      []DatabaseSchema       `json:"database_schemas,omitempty"`

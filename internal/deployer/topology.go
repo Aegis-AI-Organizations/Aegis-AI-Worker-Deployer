@@ -105,6 +105,8 @@ func (t *SandboxTopology) UnmarshalJSON(data []byte) error {
 		Services:        alias.Services,
 		Deployments:     alias.Deployments,
 		Containers:      alias.Containers,
+		Connections:     alias.Connections,
+		Routes:          alias.Routes,
 		ExternalMocks:   append(alias.ExternalMocks, alias.ExternalMocksCamel...),
 		DatabaseSchemas: append(alias.DatabaseSchemas, alias.DatabaseSchemasCamel...),
 	}
@@ -394,6 +396,13 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 				false,
 			),
 		}, errors.New("topology deployment failed for every workload")
+	}
+	if err := a.createTopologyNetworkPolicies(ctx, namespace, scanID, topology, createdWorkloads); err != nil {
+		return SandboxResponse{
+			Namespace: namespace,
+			Workloads: statuses,
+			Summary:   summarizeSandboxWorkloads(len(workloads), statuses, false),
+		}, err
 	}
 
 	for _, workload := range createdWorkloads {

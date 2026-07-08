@@ -10,6 +10,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -118,8 +119,11 @@ func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 	if len(policy.Spec.PolicyTypes) != 1 || policy.Spec.PolicyTypes[0] != "Egress" {
 		t.Fatalf("expected egress-only network policy, got %#v", policy.Spec.PolicyTypes)
 	}
-	if len(policy.Spec.Egress) != 2 || len(policy.Spec.Egress[1].Ports) != 2 {
-		t.Fatalf("expected namespace-local egress plus DNS egress ports, got %#v", policy.Spec.Egress)
+	if networkPolicyAllowsPodSelector(policy.Spec.Egress, map[string]string{}) {
+		t.Fatalf("default deny policy must not allow namespace-local pod-to-pod egress: %#v", policy.Spec.Egress)
+	}
+	if len(policy.Spec.Egress) != 2 || len(policy.Spec.Egress[0].Ports) != 2 || len(policy.Spec.Egress[1].Ports) != 4 {
+		t.Fatalf("expected kube DNS and external mock egress only, got %#v", policy.Spec.Egress)
 	}
 }
 
@@ -445,6 +449,103 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxCreatesPerWorkloadNetworkPoliciesFromTopologyGraph(t *testing.T) {
+	ctx := context.Background()
+	namespace := "aegis-war-room-scan-1"
+	k8s := fake.NewSimpleClientset()
+	createdDeployments := map[string]*appsv1.Deployment{}
+	k8s.PrependReactor("create", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		deployment := createAction.GetObject().(*appsv1.Deployment)
+		createdDeployments[deployment.Name] = deployment
+		return true, deployment, nil
+	})
+	k8s.PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction := action.(k8stesting.GetAction)
+		deployment := createdDeployments[getAction.GetName()]
+		if deployment == nil {
+			return false, nil, nil
+		}
+		readyDeployment := deployment.DeepCopy()
+		readyDeployment.Namespace = namespace
+		readyDeployment.Generation = 1
+		readyDeployment.Status = appsv1.DeploymentStatus{
+			ObservedGeneration: 1,
+			UpdatedReplicas:    *deployment.Spec.Replicas,
+			AvailableReplicas:  *deployment.Spec.Replicas,
+		}
+		return true, readyDeployment, nil
+	})
+	activities := NewActivities(k8s)
+
+	_, err := activities.CreateSandbox(ctx, SandboxRequest{
+		ScanID: "scan-1",
+		TopologyJSON: `{
+			"services": [
+				{"name":"web","image":"nginx:1.27","depends_on":["api"],"ports":[{"port":80,"container_port":8080}]},
+				{"name":"api","image":"api:latest","ports":[{"port":8080}],"depends_on":["postgres"]},
+				{"name":"postgres","image":"postgres:16","ports":[{"port":5432}]}
+			]
+		}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox returned error: %v", err)
+	}
+
+	policies, err := k8s.NetworkingV1().NetworkPolicies(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list network policies: %v", err)
+	}
+	defaultPolicy := findNetworkPolicy(policies.Items, "default-deny-egress")
+	if defaultPolicy == nil {
+		t.Fatalf("expected default deny egress policy")
+	}
+	if networkPolicyAllowsPodSelector(defaultPolicy.Spec.Egress, map[string]string{}) {
+		t.Fatalf("default egress policy must not allow all pod-to-pod traffic: %#v", defaultPolicy.Spec.Egress)
+	}
+
+	webPolicy := findNetworkPolicy(policies.Items, "sandbox-allow-web")
+	apiPolicy := findNetworkPolicy(policies.Items, "sandbox-allow-api")
+	postgresPolicy := findNetworkPolicy(policies.Items, "sandbox-allow-postgres")
+	if webPolicy == nil || apiPolicy == nil || postgresPolicy == nil {
+		t.Fatalf("expected per-workload policies, got %#v", networkPolicyNames(policies.Items))
+	}
+	assertPolicyTypes(t, webPolicy, networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress)
+	assertEgressPeer(t, webPolicy, topologyLabels("scan-1", "api"), int32(8080))
+	assertNoEgressPeer(t, webPolicy, topologyLabels("scan-1", "postgres"))
+	assertIngressPeer(t, apiPolicy, topologyLabels("scan-1", "web"), int32(8080))
+	assertEgressPeer(t, apiPolicy, topologyLabels("scan-1", "postgres"), int32(5432))
+	assertIngressPeer(t, postgresPolicy, topologyLabels("scan-1", "api"), int32(5432))
+	assertNoIngressPeer(t, postgresPolicy, topologyLabels("scan-1", "web"))
+}
+
+func TestAllowedTopologyFlowsIncludesConnectionsAndRoutes(t *testing.T) {
+	topology := &SandboxTopology{
+		Connections: []TopologyConnection{{Source: "web", Target: "api"}},
+		Routes:      []TopologyConnection{{SourceNameCamel: "api", TargetNameCamel: "postgres"}},
+	}
+	workloads := []TopologyWorkload{
+		{Name: "web", Image: "nginx"},
+		{Name: "api", Image: "api"},
+		{Name: "postgres", Image: "postgres"},
+		{Name: "unlinked", Image: "busybox"},
+	}
+
+	flows := allowedTopologyFlows(topology, workloads)
+	if _, ok := flows["web"]["api"]; !ok {
+		t.Fatalf("expected connection flow web -> api, got %#v", flows)
+	}
+	if _, ok := flows["api"]["postgres"]; !ok {
+		t.Fatalf("expected route flow api -> postgres, got %#v", flows)
+	}
+	if _, ok := flows["web"]["postgres"]; ok {
+		t.Fatalf("unexpected transitive flow web -> postgres: %#v", flows)
+	}
+	if _, ok := flows["unlinked"]; ok {
+		t.Fatalf("unexpected flow for unlinked workload: %#v", flows)
+	}
+}
+
 func indexOfString(values []string, target string) int {
 	for index, value := range values {
 		if value == target {
@@ -452,6 +553,123 @@ func indexOfString(values []string, target string) int {
 		}
 	}
 	return -1
+}
+
+func findNetworkPolicy(policies []networkingv1.NetworkPolicy, name string) *networkingv1.NetworkPolicy {
+	for i := range policies {
+		if policies[i].Name == name {
+			return &policies[i]
+		}
+	}
+	return nil
+}
+
+func networkPolicyNames(policies []networkingv1.NetworkPolicy) []string {
+	names := make([]string, 0, len(policies))
+	for _, policy := range policies {
+		names = append(names, policy.Name)
+	}
+	return names
+}
+
+func assertPolicyTypes(t *testing.T, policy *networkingv1.NetworkPolicy, expected ...networkingv1.PolicyType) {
+	t.Helper()
+	if len(policy.Spec.PolicyTypes) != len(expected) {
+		t.Fatalf("unexpected policy types for %s: %#v", policy.Name, policy.Spec.PolicyTypes)
+	}
+	for i, policyType := range expected {
+		if policy.Spec.PolicyTypes[i] != policyType {
+			t.Fatalf("unexpected policy types for %s: %#v", policy.Name, policy.Spec.PolicyTypes)
+		}
+	}
+}
+
+func assertEgressPeer(t *testing.T, policy *networkingv1.NetworkPolicy, labels map[string]string, port int32) {
+	t.Helper()
+	if !egressPeerExists(policy.Spec.Egress, labels, port) {
+		t.Fatalf("expected egress peer labels=%#v port=%d in %s: %#v", labels, port, policy.Name, policy.Spec.Egress)
+	}
+}
+
+func assertNoEgressPeer(t *testing.T, policy *networkingv1.NetworkPolicy, labels map[string]string) {
+	t.Helper()
+	if egressPeerExists(policy.Spec.Egress, labels, 0) {
+		t.Fatalf("unexpected egress peer labels=%#v in %s: %#v", labels, policy.Name, policy.Spec.Egress)
+	}
+}
+
+func assertIngressPeer(t *testing.T, policy *networkingv1.NetworkPolicy, labels map[string]string, port int32) {
+	t.Helper()
+	if !ingressPeerExists(policy.Spec.Ingress, labels, port) {
+		t.Fatalf("expected ingress peer labels=%#v port=%d in %s: %#v", labels, port, policy.Name, policy.Spec.Ingress)
+	}
+}
+
+func assertNoIngressPeer(t *testing.T, policy *networkingv1.NetworkPolicy, labels map[string]string) {
+	t.Helper()
+	if ingressPeerExists(policy.Spec.Ingress, labels, 0) {
+		t.Fatalf("unexpected ingress peer labels=%#v in %s: %#v", labels, policy.Name, policy.Spec.Ingress)
+	}
+}
+
+func egressPeerExists(rules []networkingv1.NetworkPolicyEgressRule, labels map[string]string, port int32) bool {
+	for _, rule := range rules {
+		for _, peer := range rule.To {
+			if selectorMatchesLabels(peer.PodSelector, labels) && networkPolicyPortsContain(rule.Ports, port) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func ingressPeerExists(rules []networkingv1.NetworkPolicyIngressRule, labels map[string]string, port int32) bool {
+	for _, rule := range rules {
+		for _, peer := range rule.From {
+			if selectorMatchesLabels(peer.PodSelector, labels) && networkPolicyPortsContain(rule.Ports, port) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func networkPolicyAllowsPodSelector(rules []networkingv1.NetworkPolicyEgressRule, labels map[string]string) bool {
+	for _, rule := range rules {
+		for _, peer := range rule.To {
+			if selectorMatchesLabels(peer.PodSelector, labels) && len(rule.Ports) == 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func selectorMatchesLabels(selector *metav1.LabelSelector, labels map[string]string) bool {
+	if selector == nil {
+		return false
+	}
+	if len(selector.MatchLabels) != len(labels) {
+		return false
+	}
+	for key, value := range labels {
+		if selector.MatchLabels[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func networkPolicyPortsContain(ports []networkingv1.NetworkPolicyPort, port int32) bool {
+	if port == 0 {
+		return true
+	}
+	for _, policyPort := range ports {
+		if policyPort.Port != nil && policyPort.Port.IntVal == port {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCreateSandboxCreatesStatefulTopologyWorkload(t *testing.T) {

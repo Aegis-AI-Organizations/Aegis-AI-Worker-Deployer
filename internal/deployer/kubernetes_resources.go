@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -57,13 +58,6 @@ func (a *Activities) createSandboxNetworkPolicy(ctx context.Context, namespace, 
 				{
 					To: []networkingv1.NetworkPolicyPeer{
 						{
-							PodSelector: &metav1.LabelSelector{},
-						},
-					},
-				},
-				{
-					To: []networkingv1.NetworkPolicyPeer{
-						{
 							NamespaceSelector: &metav1.LabelSelector{
 								MatchLabels: map[string]string{
 									"kubernetes.io/metadata.name": "kube-system",
@@ -82,6 +76,21 @@ func (a *Activities) createSandboxNetworkPolicy(ctx context.Context, namespace, 
 						},
 					},
 				},
+				{
+					To: []networkingv1.NetworkPolicyPeer{
+						{
+							PodSelector: &metav1.LabelSelector{
+								MatchLabels: externalMockLabels(scanID),
+							},
+						},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: ptrProtocol(corev1.ProtocolTCP), Port: ptrIntOrString(intstr.FromInt32(80))},
+						{Protocol: ptrProtocol(corev1.ProtocolTCP), Port: ptrIntOrString(intstr.FromInt32(443))},
+						{Protocol: ptrProtocol(corev1.ProtocolUDP), Port: ptrIntOrString(intstr.FromInt32(externalMockDNSPort))},
+						{Protocol: ptrProtocol(corev1.ProtocolTCP), Port: ptrIntOrString(intstr.FromInt32(externalMockDNSPort))},
+					},
+				},
 			},
 		},
 	}
@@ -96,6 +105,196 @@ func (a *Activities) createSandboxNetworkPolicy(ctx context.Context, namespace, 
 	}
 	log.Printf("[CreateSandbox] networkpolicy %s/%s created", namespace, policy.Name)
 	return nil
+}
+
+type topologyFlowMap map[string]map[string]struct{}
+
+func (a *Activities) createTopologyNetworkPolicies(ctx context.Context, namespace, scanID string, topology *SandboxTopology, workloads []TopologyWorkload) error {
+	flows := allowedTopologyFlows(topology, workloads)
+	log.Printf("[CreateSandbox] scan=%s topology network policy flow_count=%d workload_count=%d", scanID, countTopologyFlows(flows), len(workloads))
+	for _, workload := range workloads {
+		name := kubernetesName(workload.Name)
+		policy := topologyNetworkPolicy(namespace, scanID, name, workload, workloads, flows)
+		_, err := a.k8s.NetworkingV1().NetworkPolicies(namespace).Create(ctx, policy, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			log.Printf("[CreateSandbox] networkpolicy %s/%s already exists", namespace, policy.Name)
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("create topology network policy %s/%s: %w", namespace, policy.Name, err)
+		}
+		log.Printf("[CreateSandbox] networkpolicy %s/%s created", namespace, policy.Name)
+	}
+	return nil
+}
+
+func topologyNetworkPolicy(namespace, scanID, name string, workload TopologyWorkload, workloads []TopologyWorkload, flows topologyFlowMap) *networkingv1.NetworkPolicy {
+	policy := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sandbox-allow-" + name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "aegis-worker-deployer",
+				"aegis-scan":                   scanID,
+			},
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: topologyLabels(scanID, name)},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			Egress: []networkingv1.NetworkPolicyEgressRule{externalMockEgressRule(scanID)},
+		},
+	}
+
+	if targets := flows[name]; len(targets) > 0 {
+		for _, target := range sortedFlowTargets(targets) {
+			if targetWorkload, ok := findTopologyWorkload(workloads, target); ok {
+				policy.Spec.Egress = append(policy.Spec.Egress, topologyPeerEgressRule(scanID, target, targetWorkload.normalizedPorts()))
+			}
+		}
+	}
+
+	for _, source := range sortedFlowSources(flows) {
+		if _, ok := flows[source][name]; !ok {
+			continue
+		}
+		policy.Spec.Ingress = append(policy.Spec.Ingress, topologyPeerIngressRule(scanID, source, workload.normalizedPorts()))
+	}
+	return policy
+}
+
+func allowedTopologyFlows(topology *SandboxTopology, workloads []TopologyWorkload) topologyFlowMap {
+	flows := topologyFlowMap{}
+	known := map[string]struct{}{}
+	for _, workload := range workloads {
+		known[kubernetesName(workload.Name)] = struct{}{}
+	}
+	add := func(source, target string) {
+		source = kubernetesName(source)
+		target = kubernetesName(target)
+		if source == "" || target == "" || source == target {
+			return
+		}
+		if _, ok := known[source]; !ok {
+			return
+		}
+		if _, ok := known[target]; !ok {
+			return
+		}
+		if flows[source] == nil {
+			flows[source] = map[string]struct{}{}
+		}
+		flows[source][target] = struct{}{}
+	}
+
+	for _, workload := range workloads {
+		source := kubernetesName(workload.Name)
+		for _, dependency := range workload.DependsOn {
+			add(source, dependency)
+		}
+		for _, target := range workload.WaitFor {
+			add(source, strings.Split(target, ":")[0])
+		}
+	}
+	if topology != nil {
+		for _, connection := range append(topology.Connections, topology.Routes...) {
+			add(connectionSource(connection), connectionTarget(connection))
+		}
+	}
+	return flows
+}
+
+func connectionSource(connection TopologyConnection) string {
+	return firstNonEmpty(connection.Source, connection.SourceName, connection.SourceNameCamel)
+}
+
+func connectionTarget(connection TopologyConnection) string {
+	return firstNonEmpty(connection.Target, connection.TargetName, connection.TargetNameCamel)
+}
+
+func topologyPeerEgressRule(scanID, target string, ports []TopologyPort) networkingv1.NetworkPolicyEgressRule {
+	return networkingv1.NetworkPolicyEgressRule{
+		To:    []networkingv1.NetworkPolicyPeer{topologyPeer(scanID, target)},
+		Ports: topologyNetworkPolicyPorts(ports),
+	}
+}
+
+func topologyPeerIngressRule(scanID, source string, ports []TopologyPort) networkingv1.NetworkPolicyIngressRule {
+	return networkingv1.NetworkPolicyIngressRule{
+		From:  []networkingv1.NetworkPolicyPeer{topologyPeer(scanID, source)},
+		Ports: topologyNetworkPolicyPorts(ports),
+	}
+}
+
+func topologyPeer(scanID, name string) networkingv1.NetworkPolicyPeer {
+	return networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: topologyLabels(scanID, name)}}
+}
+
+func topologyNetworkPolicyPorts(ports []TopologyPort) []networkingv1.NetworkPolicyPort {
+	if len(ports) == 0 {
+		return nil
+	}
+	networkPolicyPorts := make([]networkingv1.NetworkPolicyPort, 0, len(ports))
+	for _, port := range ports {
+		protocol := corev1.ProtocolTCP
+		if strings.EqualFold(port.Protocol, "UDP") {
+			protocol = corev1.ProtocolUDP
+		}
+		networkPolicyPorts = append(networkPolicyPorts, networkingv1.NetworkPolicyPort{
+			Protocol: ptrProtocol(protocol),
+			Port:     ptrIntOrString(intstr.FromInt32(port.containerPort())),
+		})
+	}
+	return networkPolicyPorts
+}
+
+func externalMockEgressRule(scanID string) networkingv1.NetworkPolicyEgressRule {
+	return networkingv1.NetworkPolicyEgressRule{
+		To: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: externalMockLabels(scanID)}}},
+		Ports: []networkingv1.NetworkPolicyPort{
+			{Protocol: ptrProtocol(corev1.ProtocolTCP), Port: ptrIntOrString(intstr.FromInt32(80))},
+			{Protocol: ptrProtocol(corev1.ProtocolTCP), Port: ptrIntOrString(intstr.FromInt32(443))},
+			{Protocol: ptrProtocol(corev1.ProtocolUDP), Port: ptrIntOrString(intstr.FromInt32(externalMockDNSPort))},
+			{Protocol: ptrProtocol(corev1.ProtocolTCP), Port: ptrIntOrString(intstr.FromInt32(externalMockDNSPort))},
+		},
+	}
+}
+
+func findTopologyWorkload(workloads []TopologyWorkload, name string) (TopologyWorkload, bool) {
+	for _, workload := range workloads {
+		if kubernetesName(workload.Name) == name {
+			return workload, true
+		}
+	}
+	return TopologyWorkload{}, false
+}
+
+func sortedFlowTargets(targets map[string]struct{}) []string {
+	values := make([]string, 0, len(targets))
+	for target := range targets {
+		values = append(values, target)
+	}
+	sort.Strings(values)
+	return values
+}
+
+func sortedFlowSources(flows topologyFlowMap) []string {
+	values := make([]string, 0, len(flows))
+	for source := range flows {
+		values = append(values, source)
+	}
+	sort.Strings(values)
+	return values
+}
+
+func countTopologyFlows(flows topologyFlowMap) int {
+	count := 0
+	for _, targets := range flows {
+		count += len(targets)
+	}
+	return count
 }
 
 func (a *Activities) sandboxRuntimeClassName(ctx context.Context) *string {
