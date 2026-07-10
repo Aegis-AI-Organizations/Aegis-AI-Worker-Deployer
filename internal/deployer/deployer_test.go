@@ -629,6 +629,32 @@ func TestMockFunctionalEnvValueBuildsUsableDefaults(t *testing.T) {
 	}
 }
 
+func TestNormalizeFunctionalEnvValueRewritesGenericDependencyHosts(t *testing.T) {
+	workloads := []TopologyWorkload{
+		{Name: "portfolio-frontend", Image: "frontend", Ports: []TopologyPort{{Port: 80}}},
+		{Name: "portfolio-backend", Image: "backend", Ports: []TopologyPort{{Port: 8080}}},
+		{Name: "portfolio-db", Image: "postgres", Ports: []TopologyPort{{Port: 5432}}},
+	}
+	frontend := workloads[0]
+	backend := workloads[1]
+
+	if got := normalizeFunctionalEnvValue("DB_HOST", "db", backend, workloads); got != "portfolio-db" {
+		t.Fatalf("expected generic db host to be rewritten, got %q", got)
+	}
+	if got := normalizeFunctionalEnvValue("DB_HOST", "portfolio-db", backend, workloads); got != "portfolio-db" {
+		t.Fatalf("expected existing workload host to be preserved, got %q", got)
+	}
+	if got := normalizeFunctionalEnvValue("DATABASE_URL", "postgres://postgres:secret@db:5432/portfolio_db", backend, workloads); got != "postgres://postgres:secret@portfolio-db:5432/portfolio_db" {
+		t.Fatalf("expected database URL host rewrite, got %q", got)
+	}
+	if got := normalizeFunctionalEnvValue("BACKEND_URL", "http://backend", frontend, workloads); got != "http://portfolio-backend:8080" {
+		t.Fatalf("expected backend URL host rewrite, got %q", got)
+	}
+	if got := normalizeFunctionalEnvValue("SMTP_HOST", "smtp.mail.ovh.net", backend, workloads); got != "smtp.mail.ovh.net" {
+		t.Fatalf("expected external host to be preserved, got %q", got)
+	}
+}
+
 func TestShouldDropTopologyEnvSkipsImageRuntimeValues(t *testing.T) {
 	for _, key := range []string{"PATH", "PGDATA", "PG_MAJOR", "PG_VERSION", "GOSU_VERSION", "NODE_VERSION", "NGINX_VERSION", "NJS_RELEASE", "PKG_RELEASE", "REDIS_VERSION"} {
 		if !shouldDropTopologyEnv(key) {

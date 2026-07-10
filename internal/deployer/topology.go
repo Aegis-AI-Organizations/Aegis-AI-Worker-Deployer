@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -537,10 +538,93 @@ func sanitizeTopologySecrets(workload TopologyWorkload, secret string, workloads
 			log.Printf("[CreateSandbox] dropping non-secret redacted env %q from workload %q", key, workload.Name)
 			continue
 		}
+		sanitizedValue = normalizeFunctionalEnvValue(key, sanitizedValue, workload, workloads)
 		sanitized[key] = sanitizedValue
 	}
 	workload.Env = sanitized
 	return workload
+}
+
+func normalizeFunctionalEnvValue(key, value string, workload TopologyWorkload, workloads []TopologyWorkload) string {
+	upper := strings.ToUpper(strings.TrimSpace(key))
+	if strings.Contains(upper, "DATABASE_URL") {
+		return normalizeDependencyURL(value, workload, workloads, []string{"db", "postgres"}, 5432)
+	}
+	if strings.Contains(upper, "REDIS_URL") {
+		return normalizeDependencyURL(value, workload, workloads, []string{"redis"}, 6379)
+	}
+	if strings.Contains(upper, "BACKEND_URL") || strings.Contains(upper, "API_URL") {
+		return normalizeDependencyURL(value, workload, workloads, []string{"backend", "api"}, 8080)
+	}
+	if strings.Contains(upper, "DB_HOST") || strings.HasSuffix(upper, "DATABASE_HOST") {
+		return normalizeDependencyHost(value, workload, workloads, "db", "postgres")
+	}
+	if strings.Contains(upper, "REDIS_HOST") {
+		return normalizeDependencyHost(value, workload, workloads, "redis")
+	}
+	return value
+}
+
+func normalizeDependencyURL(value string, workload TopologyWorkload, workloads []TopologyWorkload, roles []string, fallbackPort int32) string {
+	trimmed := strings.TrimSpace(value)
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" {
+		return value
+	}
+	host := parsed.Hostname()
+	normalizedHost := normalizeDependencyHost(host, workload, workloads, roles...)
+	if normalizedHost == host {
+		return value
+	}
+	port := parsed.Port()
+	if port == "" {
+		port = fmt.Sprintf("%d", dependencyPort(workloads, normalizedHost, fallbackPort))
+	}
+	parsed.Host = normalizedHost + ":" + port
+	return parsed.String()
+}
+
+func normalizeDependencyHost(value string, workload TopologyWorkload, workloads []TopologyWorkload, roles ...string) string {
+	host := strings.TrimSpace(value)
+	if host == "" {
+		return value
+	}
+	host = strings.Split(host, ":")[0]
+	if topologyHasWorkload(workloads, host) {
+		return value
+	}
+	if !isGenericDependencyHost(host, roles...) {
+		return value
+	}
+	preferred := preferredDependencyHost(workload, workloads, roles...)
+	if preferred == "" || preferred == kubernetesName(workload.Name) {
+		return value
+	}
+	return preferred
+}
+
+func topologyHasWorkload(workloads []TopologyWorkload, name string) bool {
+	name = kubernetesName(name)
+	for _, workload := range workloads {
+		if kubernetesName(workload.Name) == name {
+			return true
+		}
+	}
+	return false
+}
+
+func isGenericDependencyHost(host string, roles ...string) bool {
+	host = kubernetesName(strings.TrimSpace(host))
+	if host == "localhost" || host == "127-0-0-1" || host == "0-0-0-0" {
+		return true
+	}
+	for _, role := range roles {
+		role = kubernetesName(role)
+		if host == role || host == role+"-host" || host == role+"-service" {
+			return true
+		}
+	}
+	return false
 }
 
 func replaceRedactedSecret(key, value, secret string, workload TopologyWorkload, workloads []TopologyWorkload) (string, bool) {
