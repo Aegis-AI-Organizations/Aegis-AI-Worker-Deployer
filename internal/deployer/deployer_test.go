@@ -597,6 +597,9 @@ func TestMockFunctionalEnvValueBuildsUsableDefaults(t *testing.T) {
 	if got := mockFunctionalEnvValue("DB_HOST", backend, workloads); got != "portfolio-db" {
 		t.Fatalf("unexpected DB_HOST mock: %q", got)
 	}
+	if got := mockFunctionalEnvValue("DB_PORT", backend, workloads); got != "5432" {
+		t.Fatalf("unexpected DB_PORT mock: %q", got)
+	}
 	if got := mockFunctionalEnvValue("REDIS_URL", outline, workloads); got != "redis://outline-redis:6379" {
 		t.Fatalf("unexpected REDIS_URL mock: %q", got)
 	}
@@ -606,8 +609,33 @@ func TestMockFunctionalEnvValueBuildsUsableDefaults(t *testing.T) {
 	if got := mockFunctionalEnvValue("PUBLIC_URL", frontend, workloads); got != "http://portfolio-frontend:80" {
 		t.Fatalf("unexpected PUBLIC_URL mock: %q", got)
 	}
+	if got := mockFunctionalEnvValue("FORCE_HTTPS", frontend, workloads); got != "false" {
+		t.Fatalf("unexpected boolean mock: %q", got)
+	}
+	if got := mockFunctionalEnvValue("NODE_ENV", frontend, workloads); got != "production" {
+		t.Fatalf("unexpected NODE_ENV mock: %q", got)
+	}
+	if got := mockFunctionalEnvValue("LANG", frontend, workloads); got != "C.UTF-8" {
+		t.Fatalf("unexpected LANG mock: %q", got)
+	}
+	if got := mockFunctionalEnvValue("DATABASE_CONNECTION_POOL_MAX", frontend, workloads); got != "1" {
+		t.Fatalf("unexpected pool mock: %q", got)
+	}
 	if got := mockFunctionalEnvValue("UNRELATED", frontend, workloads); got != "aegis-mock-value" {
 		t.Fatalf("unexpected generic mock: %q", got)
+	}
+}
+
+func TestShouldDropTopologyEnvSkipsImageRuntimeValues(t *testing.T) {
+	for _, key := range []string{"PATH", "PGDATA", "PG_MAJOR", "PG_VERSION", "GOSU_VERSION", "NODE_VERSION", "NGINX_VERSION", "NJS_RELEASE", "PKG_RELEASE", "REDIS_VERSION"} {
+		if !shouldDropTopologyEnv(key) {
+			t.Fatalf("expected %q to be dropped", key)
+		}
+	}
+	for _, key := range []string{"DATABASE_URL", "DB_HOST", "REDIS_URL", "FORCE_HTTPS", "NODE_ENV"} {
+		if shouldDropTopologyEnv(key) {
+			t.Fatalf("expected %q to be kept", key)
+		}
 	}
 }
 

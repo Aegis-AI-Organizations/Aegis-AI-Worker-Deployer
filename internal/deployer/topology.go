@@ -557,6 +557,24 @@ func replaceRedactedSecret(key, value, secret string, workload TopologyWorkload,
 func mockFunctionalEnvValue(key string, workload TopologyWorkload, workloads []TopologyWorkload) string {
 	upper := strings.ToUpper(strings.TrimSpace(key))
 	ports := workload.normalizedPorts()
+	if isBooleanLikeEnvKey(upper) {
+		return "false"
+	}
+	if upper == "NODE_ENV" {
+		return "production"
+	}
+	if upper == "LOG_LEVEL" {
+		return "info"
+	}
+	if upper == "LANG" || strings.HasPrefix(upper, "LC_") {
+		return "C.UTF-8"
+	}
+	if strings.Contains(upper, "POOL_MAX") || strings.Contains(upper, "POOL_MIN") || strings.Contains(upper, "CONCURRENCY") {
+		return "1"
+	}
+	if strings.Contains(upper, "UPLOAD_MAX_SIZE") {
+		return "1048576"
+	}
 	if strings.Contains(upper, "DATABASE_URL") {
 		host := preferredDependencyHost(workload, workloads, "db", "postgres")
 		return fmt.Sprintf("postgres://postgres:aegis-mock-secret@%s:5432/postgres", host)
@@ -583,12 +601,36 @@ func mockFunctionalEnvValue(key string, workload TopologyWorkload, workloads []T
 		return fmt.Sprintf("http://%s:%d", kubernetesName(workload.Name), port)
 	}
 	if strings.HasSuffix(upper, "_PORT") || upper == "PORT" {
+		if strings.Contains(upper, "DB_") || strings.Contains(upper, "POSTGRES") || strings.Contains(upper, "DATABASE") {
+			return "5432"
+		}
+		if strings.Contains(upper, "REDIS") {
+			return "6379"
+		}
+		if strings.Contains(upper, "BACKEND") || strings.Contains(upper, "API") {
+			host := preferredDependencyHost(workload, workloads, "backend", "api")
+			return fmt.Sprintf("%d", dependencyPort(workloads, host, 8080))
+		}
 		if len(ports) > 0 {
 			return fmt.Sprintf("%d", ports[0].servicePort())
 		}
 		return "80"
 	}
 	return "aegis-mock-value"
+}
+
+func isBooleanLikeEnvKey(upper string) bool {
+	return upper == "DEBUG" ||
+		strings.HasPrefix(upper, "ENABLE_") ||
+		strings.HasSuffix(upper, "_ENABLED") ||
+		strings.HasPrefix(upper, "DISABLE_") ||
+		strings.HasSuffix(upper, "_DISABLED") ||
+		strings.HasPrefix(upper, "FORCE_") ||
+		strings.HasSuffix(upper, "_SECURE") ||
+		strings.HasSuffix(upper, "_TLS") ||
+		strings.HasSuffix(upper, "_SSL") ||
+		strings.HasSuffix(upper, "_MONITOR_ONLY") ||
+		strings.HasSuffix(upper, "_ROLLING_RESTART")
 }
 
 func preferredDependencyHost(workload TopologyWorkload, workloads []TopologyWorkload, roles ...string) string {
@@ -686,7 +728,19 @@ func shouldDropTopologyEnv(key string) bool {
 	}
 	upper := strings.ToUpper(key)
 	switch upper {
-	case "PATH", "HOME", "HOSTNAME":
+	case "PATH", "HOME", "HOSTNAME", "PGDATA":
+		return true
+	default:
+		return isImageRuntimeEnvKey(upper)
+	}
+}
+
+func isImageRuntimeEnvKey(upper string) bool {
+	if strings.HasSuffix(upper, "_VERSION") || strings.HasSuffix(upper, "_RELEASE") {
+		return true
+	}
+	switch upper {
+	case "PG_MAJOR", "PG_VERSION", "GOSU_VERSION", "NODE_VERSION", "YARN_VERSION", "NGINX_VERSION", "NJS_VERSION", "NJS_RELEASE", "PKG_RELEASE", "DYNPKG_RELEASE", "ACME_VERSION", "REDIS_VERSION":
 		return true
 	default:
 		return false
