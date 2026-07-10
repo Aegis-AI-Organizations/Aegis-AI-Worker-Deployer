@@ -566,6 +566,9 @@ func mockFunctionalEnvValue(key string, workload TopologyWorkload, workloads []T
 	if upper == "LOG_LEVEL" {
 		return "info"
 	}
+	if upper == "PGSSLMODE" {
+		return "disable"
+	}
 	if upper == "LANG" || strings.HasPrefix(upper, "LC_") {
 		return "C.UTF-8"
 	}

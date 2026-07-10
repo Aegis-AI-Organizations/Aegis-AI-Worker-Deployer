@@ -618,6 +618,9 @@ func TestMockFunctionalEnvValueBuildsUsableDefaults(t *testing.T) {
 	if got := mockFunctionalEnvValue("LANG", frontend, workloads); got != "C.UTF-8" {
 		t.Fatalf("unexpected LANG mock: %q", got)
 	}
+	if got := mockFunctionalEnvValue("PGSSLMODE", backend, workloads); got != "disable" {
+		t.Fatalf("unexpected PGSSLMODE mock: %q", got)
+	}
 	if got := mockFunctionalEnvValue("DATABASE_CONNECTION_POOL_MAX", frontend, workloads); got != "1" {
 		t.Fatalf("unexpected pool mock: %q", got)
 	}
@@ -632,7 +635,7 @@ func TestShouldDropTopologyEnvSkipsImageRuntimeValues(t *testing.T) {
 			t.Fatalf("expected %q to be dropped", key)
 		}
 	}
-	for _, key := range []string{"DATABASE_URL", "DB_HOST", "REDIS_URL", "FORCE_HTTPS", "NODE_ENV"} {
+	for _, key := range []string{"DATABASE_URL", "DB_HOST", "REDIS_URL", "FORCE_HTTPS", "NODE_ENV", "PGSSLMODE"} {
 		if shouldDropTopologyEnv(key) {
 			t.Fatalf("expected %q to be kept", key)
 		}
