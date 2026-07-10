@@ -203,7 +203,65 @@ func allowedTopologyFlows(topology *SandboxTopology, workloads []TopologyWorkloa
 			add(connectionSource(connection), connectionTarget(connection))
 		}
 	}
+	for source, targets := range inferredTopologyFlows(workloads) {
+		for target := range targets {
+			add(source, target)
+		}
+	}
 	return flows
+}
+
+func inferredTopologyFlows(workloads []TopologyWorkload) topologyFlowMap {
+	flows := topologyFlowMap{}
+	add := func(source, target string) {
+		source = kubernetesName(source)
+		target = kubernetesName(target)
+		if source == "" || target == "" || source == target {
+			return
+		}
+		if flows[source] == nil {
+			flows[source] = map[string]struct{}{}
+		}
+		flows[source][target] = struct{}{}
+	}
+
+	for _, source := range workloads {
+		sourceName := kubernetesName(source.Name)
+		prefix := workloadNamePrefix(sourceName)
+		for _, target := range workloads {
+			targetName := kubernetesName(target.Name)
+			if targetName == "" || targetName == sourceName {
+				continue
+			}
+			if envMentionsWorkload(source.Env, targetName) {
+				add(sourceName, targetName)
+				continue
+			}
+			if prefix != "" && strings.HasPrefix(targetName, prefix+"-") {
+				if strings.Contains(sourceName, "frontend") && (strings.Contains(targetName, "backend") || strings.Contains(targetName, "api")) {
+					add(sourceName, targetName)
+				}
+				if (strings.Contains(sourceName, "backend") || strings.Contains(sourceName, "server") || strings.Contains(sourceName, "api")) && (strings.Contains(targetName, "db") || strings.Contains(targetName, "postgres") || strings.Contains(targetName, "redis")) {
+					add(sourceName, targetName)
+				}
+			}
+		}
+	}
+	return flows
+}
+
+func envMentionsWorkload(env map[string]string, target string) bool {
+	if len(env) == 0 || target == "" {
+		return false
+	}
+	target = kubernetesName(target)
+	for key, value := range env {
+		combined := strings.ToLower(strings.TrimSpace(key) + "=" + strings.TrimSpace(value))
+		if strings.Contains(combined, target) {
+			return true
+		}
+	}
+	return false
 }
 
 func connectionSource(connection TopologyConnection) string {

@@ -344,6 +344,7 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 		preferredEndpointWorkload = kubernetesName(preferredEndpointWorkload)
 	}
 	mockSecret := mockTopologySecret(scanID)
+	warnAboutLocalImagesWithoutArchives(scanID, orderedWorkloads)
 	if err := importTopologyImageArchives(ctx, orderedWorkloads); err != nil {
 		return SandboxResponse{}, err
 	}
@@ -353,7 +354,7 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 	createdWorkloads := make([]TopologyWorkload, 0, len(workloads))
 	statuses := make([]SandboxWorkloadStatus, 0, len(workloads))
 	for index, workload := range orderedWorkloads {
-		workload = sanitizeTopologySecrets(workload, mockSecret)
+		workload = sanitizeTopologySecrets(workload, mockSecret, orderedWorkloads)
 		name := kubernetesName(workload.Name)
 
 		log.Printf(
@@ -520,7 +521,7 @@ func mockTopologySecret(scanID string) string {
 	return fmt.Sprintf("%s-%s", topologyMockSecretPrefix, scanID)
 }
 
-func sanitizeTopologySecrets(workload TopologyWorkload, secret string) TopologyWorkload {
+func sanitizeTopologySecrets(workload TopologyWorkload, secret string, workloads []TopologyWorkload) TopologyWorkload {
 	if len(workload.Env) == 0 {
 		return workload
 	}
@@ -531,7 +532,7 @@ func sanitizeTopologySecrets(workload TopologyWorkload, secret string) TopologyW
 		if shouldDropTopologyEnv(key) {
 			continue
 		}
-		sanitizedValue, keep := replaceRedactedSecret(key, value, secret)
+		sanitizedValue, keep := replaceRedactedSecret(key, value, secret, workload, workloads)
 		if !keep {
 			log.Printf("[CreateSandbox] dropping non-secret redacted env %q from workload %q", key, workload.Name)
 			continue
@@ -542,15 +543,99 @@ func sanitizeTopologySecrets(workload TopologyWorkload, secret string) TopologyW
 	return workload
 }
 
-func replaceRedactedSecret(key, value, secret string) (string, bool) {
+func replaceRedactedSecret(key, value, secret string, workload TopologyWorkload, workloads []TopologyWorkload) (string, bool) {
 	trimmedValue := strings.TrimSpace(value)
 	if !strings.EqualFold(trimmedValue, "REDACTED") && !strings.Contains(trimmedValue, "<REDACTED") {
 		return value, true
 	}
 	if !isSecretLikeEnvKey(key) {
-		return "", false
+		return mockFunctionalEnvValue(key, workload, workloads), true
 	}
 	return mockValueForEnvKey(key, secret), true
+}
+
+func mockFunctionalEnvValue(key string, workload TopologyWorkload, workloads []TopologyWorkload) string {
+	upper := strings.ToUpper(strings.TrimSpace(key))
+	ports := workload.normalizedPorts()
+	if strings.Contains(upper, "DATABASE_URL") {
+		host := preferredDependencyHost(workload, workloads, "db", "postgres")
+		return fmt.Sprintf("postgres://postgres:aegis-mock-secret@%s:5432/postgres", host)
+	}
+	if strings.Contains(upper, "REDIS_URL") {
+		host := preferredDependencyHost(workload, workloads, "redis")
+		return fmt.Sprintf("redis://%s:6379", host)
+	}
+	if strings.Contains(upper, "DB_HOST") || strings.HasSuffix(upper, "DATABASE_HOST") {
+		return preferredDependencyHost(workload, workloads, "db", "postgres")
+	}
+	if strings.Contains(upper, "REDIS_HOST") {
+		return preferredDependencyHost(workload, workloads, "redis")
+	}
+	if strings.Contains(upper, "BACKEND_URL") || strings.Contains(upper, "API_URL") {
+		host := preferredDependencyHost(workload, workloads, "backend", "api")
+		return fmt.Sprintf("http://%s:%d", host, dependencyPort(workloads, host, 8080))
+	}
+	if strings.Contains(upper, "FRONTEND_URL") || upper == "URL" || strings.Contains(upper, "PUBLIC_URL") {
+		port := int32(80)
+		if len(ports) > 0 {
+			port = ports[0].servicePort()
+		}
+		return fmt.Sprintf("http://%s:%d", kubernetesName(workload.Name), port)
+	}
+	if strings.HasSuffix(upper, "_PORT") || upper == "PORT" {
+		if len(ports) > 0 {
+			return fmt.Sprintf("%d", ports[0].servicePort())
+		}
+		return "80"
+	}
+	return "aegis-mock-value"
+}
+
+func preferredDependencyHost(workload TopologyWorkload, workloads []TopologyWorkload, roles ...string) string {
+	prefix := workloadNamePrefix(workload.Name)
+	var fallback string
+	for _, role := range roles {
+		role = kubernetesName(role)
+		for _, candidate := range workloads {
+			name := kubernetesName(candidate.Name)
+			if name == "" || name == kubernetesName(workload.Name) {
+				continue
+			}
+			if fallback == "" && strings.Contains(name, role) {
+				fallback = name
+			}
+			if prefix != "" && strings.HasPrefix(name, prefix+"-") && strings.Contains(name, role) {
+				return name
+			}
+		}
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return kubernetesName(workload.Name)
+}
+
+func workloadNamePrefix(name string) string {
+	name = kubernetesName(name)
+	for _, suffix := range []string{"-frontend", "-backend", "-server", "-api", "-db", "-postgres", "-redis"} {
+		if strings.HasSuffix(name, suffix) {
+			return strings.TrimSuffix(name, suffix)
+		}
+	}
+	return ""
+}
+
+func dependencyPort(workloads []TopologyWorkload, name string, fallback int32) int32 {
+	for _, workload := range workloads {
+		if kubernetesName(workload.Name) != kubernetesName(name) {
+			continue
+		}
+		ports := workload.normalizedPorts()
+		if len(ports) > 0 {
+			return ports[0].servicePort()
+		}
+	}
+	return fallback
 }
 
 func isSecretLikeEnvKey(key string) bool {
@@ -605,6 +690,41 @@ func shouldDropTopologyEnv(key string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func warnAboutLocalImagesWithoutArchives(scanID string, workloads []TopologyWorkload) {
+	for _, workload := range workloads {
+		image := strings.TrimSpace(workload.Image)
+		if image == "" || !looksLikeLocalImageReference(image) {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmpty(workload.ImageArchiveRef, workload.ImageArchiveObject)) != "" {
+			continue
+		}
+		log.Printf(
+			"[CreateSandbox] scan=%s workload=%s image=%s looks local but has no image archive metadata; pod may enter ImagePullBackOff unless the image already exists on the cluster node",
+			scanID,
+			kubernetesName(workload.Name),
+			image,
+		)
+	}
+}
+
+func looksLikeLocalImageReference(image string) bool {
+	image = strings.TrimSpace(image)
+	if image == "" || strings.Contains(image, "@sha256:") {
+		return false
+	}
+	repository := strings.Split(image, ":")[0]
+	if strings.Contains(repository, "/") || strings.Contains(repository, ".") {
+		return false
+	}
+	switch repository {
+	case "alpine", "busybox", "debian", "ubuntu", "nginx", "postgres", "mysql", "mariadb", "redis", "mongo", "node", "python", "golang", "httpd":
+		return false
+	default:
+		return true
 	}
 }
 

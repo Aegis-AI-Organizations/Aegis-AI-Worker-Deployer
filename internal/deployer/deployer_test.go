@@ -554,6 +554,27 @@ func TestAllowedTopologyFlowsIncludesConnectionsAndRoutes(t *testing.T) {
 	}
 }
 
+func TestAllowedTopologyFlowsInfersCommonAppDependencies(t *testing.T) {
+	workloads := []TopologyWorkload{
+		{Name: "portfolio-frontend", Image: "frontend", Env: map[string]string{"BACKEND_URL": "http://portfolio-backend:8080"}},
+		{Name: "portfolio-backend", Image: "backend", Env: map[string]string{"DB_HOST": "portfolio-db"}},
+		{Name: "portfolio-db", Image: "postgres"},
+		{Name: "outline-server", Image: "outline"},
+		{Name: "outline-redis", Image: "redis"},
+	}
+
+	flows := allowedTopologyFlows(&SandboxTopology{}, workloads)
+	if _, ok := flows["portfolio-frontend"]["portfolio-backend"]; !ok {
+		t.Fatalf("expected inferred frontend -> backend flow, got %#v", flows)
+	}
+	if _, ok := flows["portfolio-backend"]["portfolio-db"]; !ok {
+		t.Fatalf("expected inferred backend -> db flow, got %#v", flows)
+	}
+	if _, ok := flows["outline-server"]["outline-redis"]; !ok {
+		t.Fatalf("expected inferred server -> redis flow, got %#v", flows)
+	}
+}
+
 func indexOfString(values []string, target string) int {
 	for index, value := range values {
 		if value == target {
@@ -1119,8 +1140,8 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 	if _, ok := apiEnv["PATH"]; ok {
 		t.Fatalf("runtime PATH env should not be injected: %#v", apiEnv)
 	}
-	if _, ok := apiEnv["PUBLIC_URL"]; ok {
-		t.Fatalf("non-secret redacted env should be dropped: %#v", apiEnv)
+	if !strings.HasPrefix(apiEnv["PUBLIC_URL"], "http://api:") {
+		t.Fatalf("non-secret redacted env should be replaced with functional mock value: %#v", apiEnv)
 	}
 	if _, ok := apiEnv["label:com.docker.compose.service"]; ok {
 		t.Fatalf("label-like env should be dropped: %#v", apiEnv)
