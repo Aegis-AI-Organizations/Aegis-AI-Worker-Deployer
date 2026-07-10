@@ -575,6 +575,55 @@ func TestAllowedTopologyFlowsInfersCommonAppDependencies(t *testing.T) {
 	}
 }
 
+func TestMockFunctionalEnvValueBuildsUsableDefaults(t *testing.T) {
+	workloads := []TopologyWorkload{
+		{Name: "portfolio-frontend", Image: "frontend", Ports: []TopologyPort{{Port: 80}}},
+		{Name: "portfolio-backend", Image: "backend", Ports: []TopologyPort{{Port: 8080}}},
+		{Name: "portfolio-db", Image: "postgres", Ports: []TopologyPort{{Port: 5432}}},
+		{Name: "outline-server", Image: "outline", Ports: []TopologyPort{{Port: 3000}}},
+		{Name: "outline-redis", Image: "redis", Ports: []TopologyPort{{Port: 6379}}},
+	}
+
+	frontend := workloads[0]
+	backend := workloads[1]
+	outline := workloads[3]
+
+	if got := mockFunctionalEnvValue("BACKEND_URL", frontend, workloads); got != "http://portfolio-backend:8080" {
+		t.Fatalf("unexpected BACKEND_URL mock: %q", got)
+	}
+	if got := mockFunctionalEnvValue("DATABASE_URL", backend, workloads); got != "postgres://postgres:aegis-mock-secret@portfolio-db:5432/postgres" {
+		t.Fatalf("unexpected DATABASE_URL mock: %q", got)
+	}
+	if got := mockFunctionalEnvValue("DB_HOST", backend, workloads); got != "portfolio-db" {
+		t.Fatalf("unexpected DB_HOST mock: %q", got)
+	}
+	if got := mockFunctionalEnvValue("REDIS_URL", outline, workloads); got != "redis://outline-redis:6379" {
+		t.Fatalf("unexpected REDIS_URL mock: %q", got)
+	}
+	if got := mockFunctionalEnvValue("PORT", outline, workloads); got != "3000" {
+		t.Fatalf("unexpected PORT mock: %q", got)
+	}
+	if got := mockFunctionalEnvValue("PUBLIC_URL", frontend, workloads); got != "http://portfolio-frontend:80" {
+		t.Fatalf("unexpected PUBLIC_URL mock: %q", got)
+	}
+	if got := mockFunctionalEnvValue("UNRELATED", frontend, workloads); got != "aegis-mock-value" {
+		t.Fatalf("unexpected generic mock: %q", got)
+	}
+}
+
+func TestLooksLikeLocalImageReference(t *testing.T) {
+	for _, image := range []string{"portfolio-backend", "portfolio-backend:latest"} {
+		if !looksLikeLocalImageReference(image) {
+			t.Fatalf("expected %q to look local", image)
+		}
+	}
+	for _, image := range []string{"", "nginx", "postgres:16", "ghcr.io/acme/api:latest", "localhost:5000/api:latest", "api@sha256:deadbeef"} {
+		if looksLikeLocalImageReference(image) {
+			t.Fatalf("expected %q to not look local", image)
+		}
+	}
+}
+
 func indexOfString(values []string, target string) int {
 	for index, value := range values {
 		if value == target {

@@ -716,8 +716,11 @@ func looksLikeLocalImageReference(image string) bool {
 	if image == "" || strings.Contains(image, "@sha256:") {
 		return false
 	}
+	if strings.Contains(image, "/") {
+		return false
+	}
 	repository := strings.Split(image, ":")[0]
-	if strings.Contains(repository, "/") || strings.Contains(repository, ".") {
+	if strings.Contains(repository, ".") {
 		return false
 	}
 	switch repository {
