@@ -1200,15 +1200,22 @@ func (w TopologyWorkload) waitForInitContainers(workloads []TopologyWorkload) []
 	targets := w.waitForTargets(workloads)
 	containers := make([]corev1.Container, 0, len(targets))
 	for _, target := range targets {
+		serviceHostEnv := serviceHostEnvName(target.host)
 		containers = append(containers, corev1.Container{
 			Name:            "wait-for-" + target.host,
 			Image:           "busybox:1.36",
 			ImagePullPolicy: corev1.PullIfNotPresent,
 			Command:         []string{"sh", "-c"},
-			Args:            []string{fmt.Sprintf("until nc -z %s %d; do sleep 2; done", target.host, target.port)},
+			Args:            []string{fmt.Sprintf("host=\"${%s:-%s}\"; until nc -z \"$host\" %d; do sleep 2; done", serviceHostEnv, target.host, target.port)},
 		})
 	}
 	return containers
+}
+
+func serviceHostEnvName(serviceName string) string {
+	serviceName = kubernetesName(serviceName)
+	serviceName = strings.ReplaceAll(serviceName, "-", "_")
+	return strings.ToUpper(serviceName) + "_SERVICE_HOST"
 }
 
 type topologyWaitTarget struct {

@@ -366,6 +366,9 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	if len(webDeployment.Spec.Template.Spec.InitContainers) != 2 || webDeployment.Spec.Template.Spec.InitContainers[0].Name != "wait-for-api" {
 		t.Fatalf("expected wait_for and custom init containers: %#v", webDeployment.Spec.Template.Spec.InitContainers)
 	}
+	if !strings.Contains(webDeployment.Spec.Template.Spec.InitContainers[0].Args[0], "${API_SERVICE_HOST:-api}") {
+		t.Fatalf("expected wait init container to prefer Kubernetes service env, got %#v", webDeployment.Spec.Template.Spec.InitContainers[0].Args)
+	}
 	if len(webContainer.VolumeMounts) != 3 {
 		t.Fatalf("expected config, secret, and emptyDir mounts: %#v", webContainer.VolumeMounts)
 	}
