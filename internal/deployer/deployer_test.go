@@ -716,6 +716,48 @@ func TestNormalizeProviderEnvValuesAddsPostgresDatabase(t *testing.T) {
 	}
 }
 
+func TestPostgresAppRoleBootstrapResources(t *testing.T) {
+	ctx := context.Background()
+	namespace := "aegis-war-room-scan-1"
+	k8s := fake.NewSimpleClientset(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})
+	activities := NewActivities(k8s)
+	workload := TopologyWorkload{
+		Name:  "portfolio-db",
+		Image: "postgres:16",
+		Env: map[string]string{
+			"DB_NAME":             "portfolio_db",
+			"DB_BACKEND_USER":     "backend_user",
+			"DB_BACKEND_PASSWORD": "backend-password",
+		},
+	}
+
+	if err := activities.createWorkloadFileResources(ctx, namespace, "portfolio-db", workload); err != nil {
+		t.Fatalf("createWorkloadFileResources returned error: %v", err)
+	}
+	configMap, err := k8s.CoreV1().ConfigMaps(namespace).Get(ctx, "portfolio-db-pg-init", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected postgres bootstrap configmap: %v", err)
+	}
+	script := configMap.Data["00-aegis-app-role.sh"]
+	for _, want := range []string{"DB_BACKEND_USER", "DB_BACKEND_PASSWORD", "CREATE ROLE", "GRANT CONNECT ON DATABASE"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("expected bootstrap script to contain %q, got %s", want, script)
+		}
+	}
+
+	volumes := workload.volumes("portfolio-db")
+	if len(volumes) != 1 || volumes[0].Name != "portfolio-db-pg-init" || volumes[0].ConfigMap == nil {
+		t.Fatalf("expected postgres bootstrap volume, got %#v", volumes)
+	}
+	if volumes[0].ConfigMap.DefaultMode == nil || *volumes[0].ConfigMap.DefaultMode != 0755 {
+		t.Fatalf("expected executable bootstrap configmap mode, got %#v", volumes[0].ConfigMap)
+	}
+	mounts := workload.volumeMounts("portfolio-db")
+	if len(mounts) != 1 || mounts[0].MountPath != "/docker-entrypoint-initdb.d/00-aegis-app-role.sh" || mounts[0].SubPath != "00-aegis-app-role.sh" {
+		t.Fatalf("expected postgres bootstrap mount, got %#v", mounts)
+	}
+}
+
 func TestLooksLikeLocalImageReference(t *testing.T) {
 	for _, image := range []string{"portfolio-backend", "portfolio-backend:latest"} {
 		if !looksLikeLocalImageReference(image) {

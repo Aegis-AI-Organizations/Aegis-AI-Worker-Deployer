@@ -1219,8 +1219,44 @@ func (a *Activities) createWorkloadFileResources(ctx context.Context, namespace,
 			return fmt.Errorf("create secret %s/%s: %w", namespace, secret.Name, err)
 		}
 	}
+	if workload.hasPostgresAppRoleBootstrap() {
+		configMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: workloadPostgresBootstrapName(name)},
+			Data: map[string]string{
+				"00-aegis-app-role.sh": postgresAppRoleBootstrapScript,
+			},
+		}
+		if _, err := a.k8s.CoreV1().ConfigMaps(namespace).Create(ctx, configMap, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create postgres bootstrap configmap %s/%s: %w", namespace, configMap.Name, err)
+		}
+	}
 	return nil
 }
+
+const postgresAppRoleBootstrapScript = `#!/bin/sh
+set -eu
+
+db="${POSTGRES_DB:-${DB_NAME:-postgres}}"
+app_user="${DB_BACKEND_USER:-}"
+app_password="${DB_BACKEND_PASSWORD:-}"
+
+if [ -z "$app_user" ] || [ -z "$app_password" ]; then
+	exit 0
+fi
+
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-postgres}" --dbname "$db" \
+	--set=db="$db" \
+	--set=app_user="$app_user" \
+	--set=app_password="$app_password" <<'SQL'
+SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'app_user', :'app_password')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'app_user') \gexec
+SELECT format('ALTER ROLE %I LOGIN PASSWORD %L', :'app_user', :'app_password') \gexec
+GRANT CONNECT ON DATABASE :"db" TO :"app_user";
+GRANT USAGE, CREATE ON SCHEMA public TO :"app_user";
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO :"app_user";
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"app_user";
+SQL
+`
 
 func (w TopologyWorkload) initContainers() []corev1.Container {
 	containers := make([]corev1.Container, 0, len(w.InitContainers))
@@ -1392,6 +1428,16 @@ func (w TopologyWorkload) volumes(name string) []corev1.Volume {
 			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 		})
 	}
+	if w.hasPostgresAppRoleBootstrap() {
+		defaultMode := int32(0755)
+		volumes = append(volumes, corev1.Volume{
+			Name: workloadPostgresBootstrapName(name),
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: workloadPostgresBootstrapName(name)},
+				DefaultMode:          &defaultMode,
+			}},
+		})
+	}
 	return volumes
 }
 
@@ -1419,7 +1465,22 @@ func (w TopologyWorkload) volumeMounts(name string) []corev1.VolumeMount {
 			MountPath: strings.TrimSpace(emptyDir.MountPath),
 		})
 	}
+	if w.hasPostgresAppRoleBootstrap() {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      workloadPostgresBootstrapName(name),
+			MountPath: "/docker-entrypoint-initdb.d/00-aegis-app-role.sh",
+			SubPath:   "00-aegis-app-role.sh",
+			ReadOnly:  true,
+		})
+	}
 	return mounts
+}
+
+func (w TopologyWorkload) hasPostgresAppRoleBootstrap() bool {
+	if !isPostgresWorkload(w) {
+		return false
+	}
+	return firstTopologyEnvValue(w.Env, "DB_BACKEND_USER") != "" && firstTopologyEnvValue(w.Env, "DB_BACKEND_PASSWORD") != ""
 }
 
 func fileKey(filePath string) string {
@@ -1434,6 +1495,9 @@ func workloadConfigMapName(name string) string    { return name + "-config" }
 func workloadSecretName(name string) string       { return name + "-secret" }
 func workloadConfigVolumeName(name string) string { return name + "-config" }
 func workloadSecretVolumeName(name string) string { return name + "-secret" }
+func workloadPostgresBootstrapName(name string) string {
+	return name + "-pg-init"
+}
 
 func (w TopologyWorkload) required() bool {
 	return w.Required != nil && *w.Required
