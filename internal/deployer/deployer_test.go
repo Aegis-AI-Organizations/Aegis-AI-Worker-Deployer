@@ -1203,6 +1203,7 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 						"AWS_ACCESS_KEY_ID": "REDACTED",
 						"API_KEY": "REDACTED",
 						"JWT_SECRET": "REDACTED",
+						"SECRET_KEY": "aegis-mock-secret",
 						"NODE_ENV": "production",
 						"PATH": "REDACTED",
 						"PUBLIC_URL": "REDACTED",
@@ -1276,6 +1277,9 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 	if apiEnv["JWT_SECRET"] != "aegis-mock-jwt-secret" {
 		t.Fatalf("unexpected JWT_SECRET mock: %#v", apiEnv)
 	}
+	if apiEnv["SECRET_KEY"] != "0000000000000000000000000000000000000000000000000000000000000000" {
+		t.Fatalf("expected SECRET_KEY to be normalized to a 64-character hex value: %#v", apiEnv)
+	}
 	if _, ok := apiEnv["PATH"]; ok {
 		t.Fatalf("runtime PATH env should not be injected: %#v", apiEnv)
 	}
@@ -1294,6 +1298,61 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 	if len(response.Workloads) != 2 {
 		t.Fatalf("expected workload statuses, got %#v", response.Workloads)
 	}
+}
+
+func TestCreateSandboxInjectsPortainerPodIP(t *testing.T) {
+	ctx := context.Background()
+	k8s := fake.NewSimpleClientset()
+	var portainerDeployment *appsv1.Deployment
+	k8s.PrependReactor("create", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		deployment := createAction.GetObject().(*appsv1.Deployment)
+		portainerDeployment = deployment
+		return true, deployment, nil
+	})
+	k8s.PrependReactor("create", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		service := createAction.GetObject().(*corev1.Service)
+		return true, service, nil
+	})
+	k8s.PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		deployment := portainerDeployment.DeepCopy()
+		deployment.Namespace = "aegis-war-room-scan-1"
+		deployment.Generation = 1
+		deployment.Status = appsv1.DeploymentStatus{
+			ObservedGeneration: 1,
+			UpdatedReplicas:    1,
+			AvailableReplicas:  1,
+		}
+		return true, deployment, nil
+	})
+
+	activities := NewActivities(k8s)
+	_, err := activities.CreateSandbox(ctx, SandboxRequest{
+		ScanID: "scan-1",
+		TopologyJSON: `{
+			"deployments": [{
+				"name": "portainer-vm-web",
+				"image": "portainer/agent:latest",
+				"ports": [{"port": 9001}]
+			}]
+		}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox returned error: %v", err)
+	}
+	if portainerDeployment == nil {
+		t.Fatalf("portainer deployment was not created")
+	}
+	for _, env := range portainerDeployment.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == "KUBERNETES_POD_IP" {
+			if env.ValueFrom == nil || env.ValueFrom.FieldRef == nil || env.ValueFrom.FieldRef.FieldPath != "status.podIP" {
+				t.Fatalf("unexpected KUBERNETES_POD_IP env: %#v", env)
+			}
+			return
+		}
+	}
+	t.Fatalf("missing KUBERNETES_POD_IP env: %#v", portainerDeployment.Spec.Template.Spec.Containers[0].Env)
 }
 
 func TestParseTopologyValidatesTypingAndCollisions(t *testing.T) {

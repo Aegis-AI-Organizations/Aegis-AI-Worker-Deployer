@@ -538,10 +538,19 @@ func sanitizeTopologySecrets(workload TopologyWorkload, secret string, workloads
 			continue
 		}
 		sanitizedValue = normalizeFunctionalEnvValue(key, sanitizedValue, workload, workloads)
+		sanitizedValue = normalizeSecretEnvValue(key, sanitizedValue)
 		sanitized[key] = sanitizedValue
 	}
 	workload.Env = sanitized
 	return workload
+}
+
+func normalizeSecretEnvValue(key, value string) string {
+	upper := strings.ToUpper(strings.TrimSpace(key))
+	if upper == "SECRET_KEY" || strings.HasSuffix(upper, "_SECRET_KEY") {
+		return "0000000000000000000000000000000000000000000000000000000000000000"
+	}
+	return value
 }
 
 func normalizeFunctionalEnvValue(key, value string, workload TopologyWorkload, workloads []TopologyWorkload) string {
@@ -1071,7 +1080,7 @@ func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, na
 			Args:            workload.Args,
 			WorkingDir:      workload.WorkingDir,
 			Ports:           containerPorts,
-			Env:             workload.envVars(),
+			Env:             workload.envVars(name),
 			Resources:       workload.Resources,
 			SecurityContext: workload.SecurityContext,
 			VolumeMounts:    workload.volumeMounts(name),
@@ -1636,8 +1645,30 @@ func (w TopologyWorkload) servicePorts() []corev1.ServicePort {
 	return servicePorts
 }
 
-func (w TopologyWorkload) envVars() []corev1.EnvVar {
-	return topologyEnvVars(w.Env)
+func (w TopologyWorkload) envVars(name string) []corev1.EnvVar {
+	envVars := topologyEnvVars(w.Env)
+	if isPortainerAgentWorkload(name, w.Image) && !hasTopologyEnvVar(envVars, "KUBERNETES_POD_IP") {
+		envVars = append(envVars, corev1.EnvVar{
+			Name: "KUBERNETES_POD_IP",
+			ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "status.podIP",
+			}},
+		})
+	}
+	return envVars
+}
+
+func isPortainerAgentWorkload(name, image string) bool {
+	return strings.Contains(strings.ToLower(name), "portainer") || strings.Contains(strings.ToLower(image), "portainer/agent")
+}
+
+func hasTopologyEnvVar(envVars []corev1.EnvVar, name string) bool {
+	for _, envVar := range envVars {
+		if envVar.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func topologyEnvVars(values map[string]string) []corev1.EnvVar {
