@@ -597,6 +597,9 @@ func normalizeFunctionalEnvValue(key, value string, workload TopologyWorkload, w
 	if strings.Contains(upper, "BACKEND_URL") || strings.Contains(upper, "API_URL") {
 		return normalizeDependencyURL(value, workload, workloads, []string{"backend", "api"}, 8080)
 	}
+	if strings.Contains(upper, "URL") {
+		return normalizeNamedDependencyURL(upper, value, workload, workloads)
+	}
 	if strings.Contains(upper, "DB_HOST") || strings.HasSuffix(upper, "DATABASE_HOST") {
 		return normalizeDependencyHost(value, workload, workloads, "db", "postgres")
 	}
@@ -623,6 +626,53 @@ func normalizeDependencyURL(value string, workload TopologyWorkload, workloads [
 	}
 	parsed.Host = normalizedHost + ":" + port
 	return parsed.String()
+}
+
+func normalizeNamedDependencyURL(upperKey, value string, workload TopologyWorkload, workloads []TopologyWorkload) string {
+	trimmed := strings.TrimSpace(value)
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" {
+		return value
+	}
+	host := parsed.Hostname()
+	if topologyHasWorkload(workloads, host) || !isGenericDependencyHost(host) {
+		return value
+	}
+	dependency := dependencyHostFromEnvKey(upperKey, workload, workloads)
+	if dependency == "" || dependency == kubernetesName(workload.Name) {
+		return value
+	}
+	port := parsed.Port()
+	if port == "" {
+		port = fmt.Sprintf("%d", dependencyPort(workloads, dependency, 80))
+	}
+	parsed.Host = dependency + ":" + port
+	return parsed.String()
+}
+
+func dependencyHostFromEnvKey(upperKey string, workload TopologyWorkload, workloads []TopologyWorkload) string {
+	tokens := envKeyTokens(upperKey)
+	for _, token := range tokens {
+		if token == "" || token == "URL" || token == "URI" || token == "HOST" || token == "SERVICE" || token == "INSTANCE" || token == "PUBLIC" || token == "EXTERNAL" || token == "INTERNAL" {
+			continue
+		}
+		for _, candidate := range workloads {
+			name := kubernetesName(candidate.Name)
+			if name == "" || name == kubernetesName(workload.Name) {
+				continue
+			}
+			if name == strings.ToLower(token) || strings.Contains(name, "-"+strings.ToLower(token)) || strings.Contains(name, strings.ToLower(token)+"-") {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+func envKeyTokens(upperKey string) []string {
+	return strings.FieldsFunc(upperKey, func(r rune) bool {
+		return r < 'A' || r > 'Z'
+	})
 }
 
 func normalizeDependencyHost(value string, workload TopologyWorkload, workloads []TopologyWorkload, roles ...string) string {
@@ -1090,7 +1140,7 @@ func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, na
 		return err
 	}
 	containerPorts := workload.containerPorts()
-	readinessProbe := localTCPProbe(containerPorts)
+	readinessProbe := workloadReadinessProbe(containerPorts)
 	var livenessProbe *corev1.Probe
 	if workload.Liveness != nil {
 		livenessProbe = localTCPProbe(containerPorts)
@@ -1568,6 +1618,12 @@ func localTCPProbe(containerPorts []corev1.ContainerPort) *corev1.Probe {
 			FailureThreshold:    10,
 		}
 	}
+	return nil
+}
+
+func workloadReadinessProbe(_ []corev1.ContainerPort) *corev1.Probe {
+	// Topology ports describe intended exposure, but extracted containers may not
+	// actually listen on those ports. Avoid false not-ready states in sandboxes.
 	return nil
 }
 

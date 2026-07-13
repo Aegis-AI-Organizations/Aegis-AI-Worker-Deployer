@@ -372,11 +372,8 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	if len(webContainer.VolumeMounts) != 3 {
 		t.Fatalf("expected config, secret, and emptyDir mounts: %#v", webContainer.VolumeMounts)
 	}
-	if webContainer.ReadinessProbe == nil || webContainer.ReadinessProbe.TCPSocket == nil {
-		t.Fatalf("expected readiness probe on web deployment: %#v", webContainer.ReadinessProbe)
-	}
-	if webContainer.ReadinessProbe.TCPSocket.Port.IntVal != 8080 {
-		t.Fatalf("unexpected readiness probe port: %#v", webContainer.ReadinessProbe.TCPSocket.Port)
+	if webContainer.ReadinessProbe != nil {
+		t.Fatalf("expected no synthetic readiness probe on topology deployment: %#v", webContainer.ReadinessProbe)
 	}
 	if webContainer.LivenessProbe == nil || webContainer.LivenessProbe.TCPSocket == nil {
 		t.Fatalf("expected local TCP liveness probe on web deployment: %#v", webContainer.LivenessProbe)
@@ -664,9 +661,15 @@ func TestNormalizeFunctionalEnvValueRewritesGenericDependencyHosts(t *testing.T)
 		{Name: "portfolio-frontend", Image: "frontend", Ports: []TopologyPort{{Port: 80}}},
 		{Name: "portfolio-backend", Image: "backend", Ports: []TopologyPort{{Port: 8080}}},
 		{Name: "portfolio-db", Image: "postgres", Ports: []TopologyPort{{Port: 5432}}},
+		{Name: "gitea", Image: "docker.gitea.com/gitea:latest", Ports: []TopologyPort{{Port: 3000}}},
+		{Name: "gitea-runner", Image: "docker.io/gitea/act_runner:latest"},
+		{Name: "loki", Image: "grafana/loki:latest", Ports: []TopologyPort{{Port: 3100}}},
+		{Name: "logger", Image: "logger"},
 	}
 	frontend := workloads[0]
 	backend := workloads[1]
+	runner := workloads[4]
+	logger := workloads[6]
 
 	if got := normalizeFunctionalEnvValue("DB_HOST", "db", backend, workloads); got != "portfolio-db" {
 		t.Fatalf("expected generic db host to be rewritten, got %q", got)
@@ -683,8 +686,21 @@ func TestNormalizeFunctionalEnvValueRewritesGenericDependencyHosts(t *testing.T)
 	if got := normalizeFunctionalEnvValue("BACKEND_URL", "http://backend", frontend, workloads); got != "http://portfolio-backend:8080" {
 		t.Fatalf("expected backend URL host rewrite, got %q", got)
 	}
+	if got := normalizeFunctionalEnvValue("GITEA_INSTANCE_URL", "http://203.0.113.10:3000", runner, workloads); got != "http://gitea:3000" {
+		t.Fatalf("expected named documentation IP URL rewrite, got %q", got)
+	}
+	if got := normalizeFunctionalEnvValue("LOKI_PUSH_URL", "http://localhost:3100/loki/api/v1/push", logger, workloads); got != "http://loki:3100/loki/api/v1/push" {
+		t.Fatalf("expected localhost URL to be rewritten to named dependency, got %q", got)
+	}
 	if got := normalizeFunctionalEnvValue("SMTP_HOST", "smtp.mail.ovh.net", backend, workloads); got != "smtp.mail.ovh.net" {
 		t.Fatalf("expected external host to be preserved, got %q", got)
+	}
+}
+
+func TestWorkloadReadinessProbeIsNotSynthesized(t *testing.T) {
+	ports := []corev1.ContainerPort{{ContainerPort: 80}}
+	if probe := workloadReadinessProbe(ports); probe != nil {
+		t.Fatalf("expected no synthetic readiness probe, got %#v", probe)
 	}
 }
 
