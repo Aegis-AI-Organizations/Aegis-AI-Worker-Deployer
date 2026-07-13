@@ -541,8 +541,41 @@ func sanitizeTopologySecrets(workload TopologyWorkload, secret string, workloads
 		sanitizedValue = normalizeSecretEnvValue(key, sanitizedValue)
 		sanitized[key] = sanitizedValue
 	}
+	sanitized = normalizeProviderEnvValues(workload, sanitized)
 	workload.Env = sanitized
 	return workload
+}
+
+func normalizeProviderEnvValues(workload TopologyWorkload, env map[string]string) map[string]string {
+	if !isPostgresWorkload(workload) {
+		return env
+	}
+	if _, ok := env["POSTGRES_DB"]; !ok {
+		if value := firstTopologyEnvValue(env, "DB_NAME", "DATABASE_NAME"); value != "" {
+			env["POSTGRES_DB"] = value
+		}
+	}
+	if _, ok := env["POSTGRES_PASSWORD"]; !ok {
+		if value := firstTopologyEnvValue(env, "DB_ADMIN_PASSWORD", "DB_PASSWORD", "DATABASE_PASSWORD"); value != "" {
+			env["POSTGRES_PASSWORD"] = value
+		}
+	}
+	return env
+}
+
+func firstTopologyEnvValue(env map[string]string, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(env[key]); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func isPostgresWorkload(workload TopologyWorkload) bool {
+	name := kubernetesName(workload.Name)
+	image := strings.ToLower(strings.TrimSpace(workload.Image))
+	return strings.Contains(name, "postgres") || strings.Contains(image, "postgres") || strings.Contains(image, "postgresql")
 }
 
 func normalizeSecretEnvValue(key, value string) string {
@@ -622,10 +655,11 @@ func topologyHasWorkload(workloads []TopologyWorkload, name string) bool {
 }
 
 func isGenericDependencyHost(host string, roles ...string) bool {
-	host = kubernetesName(strings.TrimSpace(host))
-	if host == "localhost" || host == "127-0-0-1" || host == "0-0-0-0" {
+	rawHost := strings.TrimSpace(host)
+	if rawHost == "localhost" || rawHost == "127.0.0.1" || rawHost == "0.0.0.0" || isDocumentationIP(rawHost) {
 		return true
 	}
+	host = kubernetesName(rawHost)
 	for _, role := range roles {
 		role = kubernetesName(role)
 		if host == role || host == role+"-host" || host == role+"-service" {
@@ -633,6 +667,10 @@ func isGenericDependencyHost(host string, roles ...string) bool {
 		}
 	}
 	return false
+}
+
+func isDocumentationIP(host string) bool {
+	return strings.HasPrefix(host, "192.0.2.") || strings.HasPrefix(host, "198.51.100.") || strings.HasPrefix(host, "203.0.113.")
 }
 
 func replaceRedactedSecret(key, value, secret string, workload TopologyWorkload, workloads []TopologyWorkload) (string, bool) {

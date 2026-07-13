@@ -680,6 +680,9 @@ func TestNormalizeFunctionalEnvValueRewritesGenericDependencyHosts(t *testing.T)
 	if got := normalizeFunctionalEnvValue("DATABASE_URL", "postgres://postgres:secret@db:5432/portfolio_db", backend, workloads); got != "postgres://postgres:secret@portfolio-db:5432/portfolio_db" {
 		t.Fatalf("expected database URL host rewrite, got %q", got)
 	}
+	if got := normalizeFunctionalEnvValue("DATABASE_URL", "postgres://postgres:secret@203.0.113.10:5432/portfolio_db", backend, workloads); got != "postgres://postgres:secret@portfolio-db:5432/portfolio_db" {
+		t.Fatalf("expected documentation IP database URL host rewrite, got %q", got)
+	}
 	if got := normalizeFunctionalEnvValue("BACKEND_URL", "http://backend", frontend, workloads); got != "http://portfolio-backend:8080" {
 		t.Fatalf("expected backend URL host rewrite, got %q", got)
 	}
@@ -698,6 +701,21 @@ func TestShouldDropTopologyEnvSkipsImageRuntimeValues(t *testing.T) {
 		if shouldDropTopologyEnv(key) {
 			t.Fatalf("expected %q to be kept", key)
 		}
+	}
+}
+
+func TestNormalizeProviderEnvValuesAddsPostgresDatabase(t *testing.T) {
+	workload := TopologyWorkload{Name: "portfolio-db", Image: "postgres:latest"}
+	env := normalizeProviderEnvValues(workload, map[string]string{
+		"DB_NAME":           "portfolio_db",
+		"DB_ADMIN_PASSWORD": "aegis-mock-secret",
+	})
+
+	if env["POSTGRES_DB"] != "portfolio_db" {
+		t.Fatalf("expected POSTGRES_DB from DB_NAME, got %#v", env)
+	}
+	if env["POSTGRES_PASSWORD"] != "aegis-mock-secret" {
+		t.Fatalf("expected POSTGRES_PASSWORD from DB_ADMIN_PASSWORD, got %#v", env)
 	}
 }
 
