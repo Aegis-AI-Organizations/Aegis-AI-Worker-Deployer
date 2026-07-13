@@ -668,6 +668,7 @@ func TestNormalizeFunctionalEnvValueRewritesGenericDependencyHosts(t *testing.T)
 	}
 	frontend := workloads[0]
 	backend := workloads[1]
+	gitea := workloads[3]
 	runner := workloads[4]
 	logger := workloads[6]
 
@@ -688,6 +689,9 @@ func TestNormalizeFunctionalEnvValueRewritesGenericDependencyHosts(t *testing.T)
 	}
 	if got := normalizeFunctionalEnvValue("GITEA_INSTANCE_URL", "http://203.0.113.10:3000", runner, workloads); got != "http://gitea:3000" {
 		t.Fatalf("expected named documentation IP URL rewrite, got %q", got)
+	}
+	if got := normalizeFunctionalEnvValue("GITEA_INSTANCE_URL", "http://203.0.113.10:3000", gitea, workloads); got != "http://203.0.113.10:3000" {
+		t.Fatalf("expected self-token URL to avoid derivative dependency rewrite, got %q", got)
 	}
 	if got := normalizeFunctionalEnvValue("LOKI_PUSH_URL", "http://localhost:3100/loki/api/v1/push", logger, workloads); got != "http://loki:3100/loki/api/v1/push" {
 		t.Fatalf("expected localhost URL to be rewritten to named dependency, got %q", got)

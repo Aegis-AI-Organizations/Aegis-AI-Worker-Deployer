@@ -652,16 +652,30 @@ func normalizeNamedDependencyURL(upperKey, value string, workload TopologyWorklo
 
 func dependencyHostFromEnvKey(upperKey string, workload TopologyWorkload, workloads []TopologyWorkload) string {
 	tokens := envKeyTokens(upperKey)
+	currentName := kubernetesName(workload.Name)
 	for _, token := range tokens {
 		if token == "" || token == "URL" || token == "URI" || token == "HOST" || token == "SERVICE" || token == "INSTANCE" || token == "PUBLIC" || token == "EXTERNAL" || token == "INTERNAL" {
 			continue
 		}
+		token = strings.ToLower(token)
+		if token == currentName {
+			continue
+		}
 		for _, candidate := range workloads {
 			name := kubernetesName(candidate.Name)
-			if name == "" || name == kubernetesName(workload.Name) {
+			if name == "" || name == currentName {
 				continue
 			}
-			if name == strings.ToLower(token) || strings.Contains(name, "-"+strings.ToLower(token)) || strings.Contains(name, strings.ToLower(token)+"-") {
+			if name == token {
+				return name
+			}
+		}
+		for _, candidate := range workloads {
+			name := kubernetesName(candidate.Name)
+			if name == "" || name == currentName {
+				continue
+			}
+			if strings.Contains(name, "-"+token) || strings.Contains(name, token+"-") {
 				return name
 			}
 		}
