@@ -470,7 +470,7 @@ func TestTopologyWorkloadInfersWaitForTargetsFromEnvironment(t *testing.T) {
 	workloads := []TopologyWorkload{
 		{Name: "portfolio-frontend", Image: "frontend", Env: map[string]string{"BACKEND_URL": "http://portfolio-backend:8080"}},
 		{Name: "portfolio-backend", Image: "backend", Env: map[string]string{"DB_HOST": "portfolio-db"}},
-		{Name: "portfolio-db", Image: "postgres", Ports: []TopologyPort{{Port: 5432}}},
+		{Name: "portfolio-db", Image: "postgres", Ports: []TopologyPort{{Port: 5432}}, Env: map[string]string{"BACKEND_URL": "http://portfolio-backend:8080"}},
 		{Name: "redis", Image: "redis", Ports: []TopologyPort{{Port: 6379}}},
 	}
 
@@ -482,6 +482,11 @@ func TestTopologyWorkloadInfersWaitForTargetsFromEnvironment(t *testing.T) {
 	backendTargets := workloads[1].waitForTargets(workloads)
 	if len(backendTargets) != 1 || backendTargets[0].host != "portfolio-db" || backendTargets[0].port != 5432 {
 		t.Fatalf("unexpected backend wait targets: %#v", backendTargets)
+	}
+
+	databaseTargets := workloads[2].waitForTargets(workloads)
+	if len(databaseTargets) != 0 {
+		t.Fatalf("expected database workload to ignore inherited app env dependencies, got %#v", databaseTargets)
 	}
 }
 

@@ -1255,12 +1255,25 @@ func (w TopologyWorkload) waitForTargets(workloads []TopologyWorkload) []topolog
 	for _, dependency := range normalizeTopologyDependencies(w.DependsOn) {
 		add(dependency, dependencyPort(workloads, dependency, 80))
 	}
-	for key, value := range w.Env {
-		for _, target := range envWaitTargets(key, value, workloads) {
-			add(target.host, target.port)
+	if !isDependencyProviderWorkload(w) {
+		for key, value := range w.Env {
+			for _, target := range envWaitTargets(key, value, workloads) {
+				add(target.host, target.port)
+			}
 		}
 	}
 	return targets
+}
+
+func isDependencyProviderWorkload(workload TopologyWorkload) bool {
+	name := kubernetesName(workload.Name)
+	image := strings.ToLower(strings.TrimSpace(workload.Image))
+	for _, marker := range []string{"-db", "db-", "database", "postgres", "postgresql", "mysql", "mariadb", "mongo", "redis", "memcached"} {
+		if strings.Contains(name, marker) || strings.Contains(image, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func envWaitTargets(key, value string, workloads []TopologyWorkload) []topologyWaitTarget {
