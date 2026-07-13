@@ -1344,15 +1344,25 @@ func TestCreateSandboxInjectsPortainerPodIP(t *testing.T) {
 	if portainerDeployment == nil {
 		t.Fatalf("portainer deployment was not created")
 	}
+	var hasPodIP bool
+	var hasClusterAddr bool
 	for _, env := range portainerDeployment.Spec.Template.Spec.Containers[0].Env {
 		if env.Name == "KUBERNETES_POD_IP" {
 			if env.ValueFrom == nil || env.ValueFrom.FieldRef == nil || env.ValueFrom.FieldRef.FieldPath != "status.podIP" {
 				t.Fatalf("unexpected KUBERNETES_POD_IP env: %#v", env)
 			}
-			return
+			hasPodIP = true
+		}
+		if env.Name == "AGENT_CLUSTER_ADDR" {
+			if env.Value != "127.0.0.1" {
+				t.Fatalf("unexpected AGENT_CLUSTER_ADDR env: %#v", env)
+			}
+			hasClusterAddr = true
 		}
 	}
-	t.Fatalf("missing KUBERNETES_POD_IP env: %#v", portainerDeployment.Spec.Template.Spec.Containers[0].Env)
+	if !hasPodIP || !hasClusterAddr {
+		t.Fatalf("missing portainer runtime env: %#v", portainerDeployment.Spec.Template.Spec.Containers[0].Env)
+	}
 }
 
 func TestParseTopologyValidatesTypingAndCollisions(t *testing.T) {

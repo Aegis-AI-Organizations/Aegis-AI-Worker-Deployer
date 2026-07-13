@@ -1647,13 +1647,18 @@ func (w TopologyWorkload) servicePorts() []corev1.ServicePort {
 
 func (w TopologyWorkload) envVars(name string) []corev1.EnvVar {
 	envVars := topologyEnvVars(w.Env)
-	if isPortainerAgentWorkload(name, w.Image) && !hasTopologyEnvVar(envVars, "KUBERNETES_POD_IP") {
-		envVars = append(envVars, corev1.EnvVar{
-			Name: "KUBERNETES_POD_IP",
-			ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
-				FieldPath: "status.podIP",
-			}},
-		})
+	if isPortainerAgentWorkload(name, w.Image) {
+		if !hasTopologyEnvVar(envVars, "KUBERNETES_POD_IP") {
+			envVars = append(envVars, corev1.EnvVar{
+				Name: "KUBERNETES_POD_IP",
+				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "status.podIP",
+				}},
+			})
+		}
+		if !hasTopologyEnvVar(envVars, "AGENT_CLUSTER_ADDR") {
+			envVars = append(envVars, corev1.EnvVar{Name: "AGENT_CLUSTER_ADDR", Value: "127.0.0.1"})
+		}
 	}
 	return envVars
 }
