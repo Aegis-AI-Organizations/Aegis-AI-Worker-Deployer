@@ -111,7 +111,7 @@ func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 	if err != nil {
 		t.Fatalf("external mock configmap was not created: %v", err)
 	}
-	if !strings.Contains(mockConfig.Data["default.conf"], "listen 8443 ssl") {
+	if !strings.Contains(mockConfig.Data["default.conf"], "listen 8443") {
 		t.Fatalf("expected HTTPS mock listener, got %q", mockConfig.Data["default.conf"])
 	}
 	policy, err := k8s.NetworkingV1().NetworkPolicies(response.Namespace).Get(ctx, "default-deny-egress", metav1.GetOptions{})
@@ -442,15 +442,12 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	if !strings.Contains(mockConfig.Data["default.conf"], "return 200") {
 		t.Fatalf("expected HTTP mock to return 200, got %q", mockConfig.Data["default.conf"])
 	}
-	if !strings.Contains(mockConfig.Data["default.conf"], "listen 8443 ssl") {
-		t.Fatalf("expected HTTPS mock to listen with TLS, got %q", mockConfig.Data["default.conf"])
+	if !strings.Contains(mockConfig.Data["default.conf"], "listen 8443") {
+		t.Fatalf("expected HTTPS mock port to listen, got %q", mockConfig.Data["default.conf"])
 	}
 	httpContainer := mockDeployment.Spec.Template.Spec.Containers[0]
 	if !strings.Contains(httpContainer.Image, "openresty/openresty") {
 		t.Fatalf("expected OpenResty mock image for Lua latency support, got %q", httpContainer.Image)
-	}
-	if len(httpContainer.Args) != 1 || !strings.Contains(httpContainer.Args[0], "openssl req -x509") {
-		t.Fatalf("expected mock TLS material to be generated at startup, got %#v", httpContainer.Args)
 	}
 	if !strings.Contains(httpContainer.Args[0], "/usr/local/openresty/bin/openresty -g 'daemon off;'") {
 		t.Fatalf("expected mock to start OpenResty with absolute path, got %#v", httpContainer.Args)

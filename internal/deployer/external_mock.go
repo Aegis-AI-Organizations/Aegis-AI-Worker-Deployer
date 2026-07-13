@@ -153,10 +153,8 @@ server {
 }
 
 server {
-    listen {{ .HTTPSPort }} ssl default_server;
+    listen {{ .HTTPSPort }} default_server;
     access_log /var/log/aegis/traffic.log aegis;
-    ssl_certificate /etc/nginx/mock-tls/tls.crt;
-    ssl_certificate_key /etc/nginx/mock-tls/tls.key;
 {{ template "locations" .Locations }}
     location / {
         add_header Content-Type text/plain;
@@ -415,14 +413,7 @@ func (a *Activities) createExternalMockDeployment(ctx context.Context, namespace
 							Image:           "openresty/openresty:1.27.1.2-alpine",
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Command:         []string{"/bin/sh", "-c"},
-							Args: []string{
-								"mkdir -p /etc/nginx/mock-tls && " +
-									"openssl req -x509 -nodes -newkey rsa:2048 " +
-									"-keyout /etc/nginx/mock-tls/tls.key " +
-									"-out /etc/nginx/mock-tls/tls.crt " +
-									"-days 1 -subj /CN=external-api-mock >/dev/null 2>&1 && " +
-									"/usr/local/openresty/bin/openresty -g 'daemon off;'",
-							},
+							Args:            []string{"/usr/local/openresty/bin/openresty -g 'daemon off;'"},
 							Ports: []corev1.ContainerPort{{
 								Name:          "http",
 								ContainerPort: externalMockHTTPPort,
@@ -438,10 +429,6 @@ func (a *Activities) createExternalMockDeployment(ctx context.Context, namespace
 									MountPath: "/usr/local/openresty/nginx/conf/nginx.conf",
 									SubPath:   "default.conf",
 									ReadOnly:  true,
-								},
-								{
-									Name:      "external-mock-tls",
-									MountPath: "/etc/nginx/mock-tls",
 								},
 								{
 									Name:      "external-mock-traffic",
@@ -484,11 +471,6 @@ func (a *Activities) createExternalMockDeployment(ctx context.Context, namespace
 								LocalObjectReference: corev1.LocalObjectReference{Name: externalMockName},
 								DefaultMode:          &mode,
 							},
-						},
-					}, {
-						Name: "external-mock-tls",
-						VolumeSource: corev1.VolumeSource{
-							EmptyDir: &corev1.EmptyDirVolumeSource{},
 						},
 					}, {
 						Name: "external-mock-traffic",
