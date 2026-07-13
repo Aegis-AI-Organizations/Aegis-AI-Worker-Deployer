@@ -247,17 +247,20 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	createdDeployments := map[string]*appsv1.Deployment{}
 	createdDeploymentOrder := []string{}
 	createdServices := map[string]*corev1.Service{}
+	createdResourceOrder := []string{}
 	k8s.PrependReactor("create", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		createAction := action.(k8stesting.CreateAction)
 		deployment := createAction.GetObject().(*appsv1.Deployment)
 		createdDeployments[deployment.Name] = deployment
 		createdDeploymentOrder = append(createdDeploymentOrder, deployment.Name)
+		createdResourceOrder = append(createdResourceOrder, "deployment/"+deployment.Name)
 		return true, deployment, nil
 	})
 	k8s.PrependReactor("create", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		createAction := action.(k8stesting.CreateAction)
 		service := createAction.GetObject().(*corev1.Service)
 		createdServices[service.Name] = service
+		createdResourceOrder = append(createdResourceOrder, "service/"+service.Name)
 		return true, service, nil
 	})
 	k8s.PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
@@ -332,6 +335,9 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	}
 	if indexOfString(createdDeploymentOrder, "api") > indexOfString(createdDeploymentOrder, "web-frontend") {
 		t.Fatalf("expected api dependency before web deployment, got %#v", createdDeploymentOrder)
+	}
+	if indexOfString(createdResourceOrder, "service/api") > indexOfString(createdResourceOrder, "deployment/web-frontend") {
+		t.Fatalf("expected dependency service before dependent deployment, got %#v", createdResourceOrder)
 	}
 
 	webDeployment := createdDeployments["web-frontend"]
@@ -454,6 +460,25 @@ func TestCreateSandboxCreatesTopologyDeploymentsAndServices(t *testing.T) {
 	apiContainer := apiDeployment.Spec.Template.Spec.Containers[0]
 	if len(apiContainer.Env) != 1 || apiContainer.Env[0].Name != "DB_HOST" || apiContainer.Env[0].Value != "postgres" {
 		t.Fatalf("unexpected api env: %#v", apiContainer.Env)
+	}
+}
+
+func TestTopologyWorkloadInfersWaitForTargetsFromEnvironment(t *testing.T) {
+	workloads := []TopologyWorkload{
+		{Name: "portfolio-frontend", Image: "frontend", Env: map[string]string{"BACKEND_URL": "http://portfolio-backend:8080"}},
+		{Name: "portfolio-backend", Image: "backend", Env: map[string]string{"DB_HOST": "portfolio-db"}},
+		{Name: "portfolio-db", Image: "postgres", Ports: []TopologyPort{{Port: 5432}}},
+		{Name: "redis", Image: "redis", Ports: []TopologyPort{{Port: 6379}}},
+	}
+
+	frontendTargets := workloads[0].waitForTargets(workloads)
+	if len(frontendTargets) != 1 || frontendTargets[0].host != "portfolio-backend" || frontendTargets[0].port != 8080 {
+		t.Fatalf("unexpected frontend wait targets: %#v", frontendTargets)
+	}
+
+	backendTargets := workloads[1].waitForTargets(workloads)
+	if len(backendTargets) != 1 || backendTargets[0].host != "portfolio-db" || backendTargets[0].port != 5432 {
+		t.Fatalf("unexpected backend wait targets: %#v", backendTargets)
 	}
 }
 

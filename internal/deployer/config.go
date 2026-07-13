@@ -30,5 +30,5 @@ var (
 	newWorker                      = worker.New
 	temporalConnectMaxAttempts     = 0
 	temporalConnectRetryDelay      = 2 * time.Second
-	topologyDeploymentReadyTimeout = 15 * time.Second
+	topologyDeploymentReadyTimeout = 60 * time.Second
 )

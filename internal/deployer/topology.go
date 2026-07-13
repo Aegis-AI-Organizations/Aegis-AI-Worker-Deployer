@@ -349,13 +349,25 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 	if err := importTopologyImageArchives(ctx, orderedWorkloads); err != nil {
 		return SandboxResponse{}, err
 	}
+	for i, workload := range orderedWorkloads {
+		orderedWorkloads[i] = sanitizeTopologySecrets(workload, mockSecret, orderedWorkloads)
+	}
+
 	firstServiceName := kubernetesName(workloads[0].Name)
 	firstReadyServiceName := ""
 	firstReadyServicePort := int32(0)
 	createdWorkloads := make([]TopologyWorkload, 0, len(workloads))
 	statuses := make([]SandboxWorkloadStatus, 0, len(workloads))
+	for _, workload := range orderedWorkloads {
+		name := kubernetesName(workload.Name)
+		if len(workload.normalizedPorts()) == 0 {
+			continue
+		}
+		if err := a.createTopologyService(ctx, namespace, scanID, name, workload); err != nil {
+			log.Printf("[CreateSandbox] service %s/%s failed before deployment; workload will still be attempted: %v", namespace, name, err)
+		}
+	}
 	for index, workload := range orderedWorkloads {
-		workload = sanitizeTopologySecrets(workload, mockSecret, orderedWorkloads)
 		name := kubernetesName(workload.Name)
 
 		log.Printf(
@@ -368,7 +380,7 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 			len(workload.normalizedPorts()),
 			len(workload.Env),
 		)
-		if err := a.createDeployment(ctx, namespace, scanID, name, workload, mockDNSIP); err != nil {
+		if err := a.createDeployment(ctx, namespace, scanID, name, workload, orderedWorkloads, mockDNSIP); err != nil {
 			log.Printf("[CreateSandbox] deployment %s/%s failed; continuing topology deployment: %v", namespace, name, err)
 			statuses = append(statuses, SandboxWorkloadStatus{
 				Name:   name,
@@ -377,19 +389,6 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 				Error:  err.Error(),
 			})
 			continue
-		}
-		if len(workload.normalizedPorts()) > 0 {
-			if err := a.createTopologyService(ctx, namespace, scanID, name, workload); err != nil {
-				log.Printf("[CreateSandbox] service %s/%s failed; workload remains deployed without service: %v", namespace, name, err)
-				statuses = append(statuses, SandboxWorkloadStatus{
-					Name:   name,
-					Image:  workload.Image,
-					Status: "deployed",
-					Error:  err.Error(),
-				})
-				createdWorkloads = append(createdWorkloads, workload)
-				continue
-			}
 		}
 		statuses = append(statuses, SandboxWorkloadStatus{
 			Name:    name,
@@ -1035,7 +1034,7 @@ func imageArchiveObject(ref string) (string, string, error) {
 	return bucket, object, nil
 }
 
-func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, name string, workload TopologyWorkload, mockDNSIP string) error {
+func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, name string, workload TopologyWorkload, workloads []TopologyWorkload, mockDNSIP string) error {
 	replicas := int32(1)
 	if workload.Replicas != nil && *workload.Replicas > 0 {
 		replicas = *workload.Replicas
@@ -1080,9 +1079,7 @@ func (a *Activities) createDeployment(ctx context.Context, namespace, scanID, na
 			LivenessProbe:   livenessProbe,
 		}},
 	}
-	if len(workload.WaitFor) > 0 {
-		podSpec.InitContainers = append(workload.waitForInitContainers(), podSpec.InitContainers...)
-	}
+	podSpec.InitContainers = append(workload.waitForInitContainers(workloads), podSpec.InitContainers...)
 	if workload.Stateful {
 		return a.createStatefulSet(ctx, namespace, scanID, name, labels, replicas, podSpec, workload)
 	}
@@ -1199,24 +1196,109 @@ func (w TopologyWorkload) initContainers() []corev1.Container {
 	return containers
 }
 
-func (w TopologyWorkload) waitForInitContainers() []corev1.Container {
-	containers := make([]corev1.Container, 0, len(w.WaitFor))
-	for _, target := range w.WaitFor {
-		parts := strings.Split(target, ":")
-		host := kubernetesName(parts[0])
-		port := "80"
-		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-			port = strings.TrimSpace(parts[1])
-		}
+func (w TopologyWorkload) waitForInitContainers(workloads []TopologyWorkload) []corev1.Container {
+	targets := w.waitForTargets(workloads)
+	containers := make([]corev1.Container, 0, len(targets))
+	for _, target := range targets {
 		containers = append(containers, corev1.Container{
-			Name:            "wait-for-" + host,
+			Name:            "wait-for-" + target.host,
 			Image:           "busybox:1.36",
 			ImagePullPolicy: corev1.PullIfNotPresent,
 			Command:         []string{"sh", "-c"},
-			Args:            []string{fmt.Sprintf("until nc -z %s %s; do sleep 2; done", host, port)},
+			Args:            []string{fmt.Sprintf("until nc -z %s %d; do sleep 2; done", target.host, target.port)},
 		})
 	}
 	return containers
+}
+
+type topologyWaitTarget struct {
+	host string
+	port int32
+}
+
+func (w TopologyWorkload) waitForTargets(workloads []TopologyWorkload) []topologyWaitTarget {
+	targets := []topologyWaitTarget{}
+	seen := map[string]struct{}{}
+	add := func(host string, port int32) {
+		host = kubernetesName(host)
+		if host == "" || host == kubernetesName(w.Name) || !topologyHasWorkload(workloads, host) {
+			return
+		}
+		if port <= 0 {
+			port = dependencyPort(workloads, host, 80)
+		}
+		key := fmt.Sprintf("%s:%d", host, port)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, topologyWaitTarget{host: host, port: port})
+	}
+
+	for _, target := range w.WaitFor {
+		parts := strings.Split(target, ":")
+		port := int32(80)
+		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+			if parsed, err := parsePort(strings.TrimSpace(parts[1])); err == nil {
+				port = parsed
+			}
+		}
+		add(parts[0], port)
+	}
+	for _, dependency := range normalizeTopologyDependencies(w.DependsOn) {
+		add(dependency, dependencyPort(workloads, dependency, 80))
+	}
+	for key, value := range w.Env {
+		for _, target := range envWaitTargets(key, value, workloads) {
+			add(target.host, target.port)
+		}
+	}
+	return targets
+}
+
+func envWaitTargets(key, value string, workloads []TopologyWorkload) []topologyWaitTarget {
+	upper := strings.ToUpper(strings.TrimSpace(key))
+	targets := []topologyWaitTarget{}
+	add := func(host string, port int32) {
+		host = kubernetesName(host)
+		if host == "" || !topologyHasWorkload(workloads, host) {
+			return
+		}
+		if port <= 0 {
+			port = dependencyPort(workloads, host, 80)
+		}
+		targets = append(targets, topologyWaitTarget{host: host, port: port})
+	}
+
+	if strings.Contains(upper, "DATABASE_URL") || strings.Contains(upper, "REDIS_URL") || strings.Contains(upper, "BACKEND_URL") || strings.Contains(upper, "API_URL") || strings.HasSuffix(upper, "_URL") {
+		if parsed, err := url.Parse(strings.TrimSpace(value)); err == nil && parsed.Hostname() != "" {
+			port := int32(0)
+			if parsed.Port() != "" {
+				if parsedPort, err := parsePort(parsed.Port()); err == nil {
+					port = parsedPort
+				}
+			}
+			add(parsed.Hostname(), port)
+		}
+	}
+	if strings.Contains(upper, "DB_HOST") || strings.HasSuffix(upper, "DATABASE_HOST") {
+		add(value, 5432)
+	}
+	if strings.Contains(upper, "REDIS_HOST") {
+		add(value, 6379)
+	}
+	return targets
+}
+
+func parsePort(value string) (int32, error) {
+	var port int32
+	if _, err := fmt.Sscanf(strings.TrimSpace(value), "%d", &port); err != nil {
+		return 0, err
+	}
+	if port <= 0 || port > 65535 {
+		return 0, fmt.Errorf("invalid port %q", value)
+	}
+	return port, nil
 }
 
 func (w TopologyWorkload) volumes(name string) []corev1.Volume {
