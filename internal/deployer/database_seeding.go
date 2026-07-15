@@ -7,11 +7,13 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 const defaultSeedFlag = "aegis-flag-1234"
@@ -52,7 +54,11 @@ func (a *Activities) SeedTargetDatabases(ctx context.Context, req SeedDatabaseRe
 		if !strings.Contains(sql, req.SeedFlag) {
 			sql += "\n-- aegis seed flag: " + req.SeedFlag + "\n"
 		}
-		if err := a.createDatabaseSeedJob(ctx, namespace, req.ScanID, target, sql); err != nil {
+		jobName, err := a.createDatabaseSeedJob(ctx, namespace, req.ScanID, target, sql)
+		if err != nil {
+			return SeedDatabaseResponse{}, err
+		}
+		if err := a.waitForDatabaseSeedJob(ctx, namespace, jobName, databaseSeedJobReadyTimeout); err != nil {
 			return SeedDatabaseResponse{}, err
 		}
 		seeded = append(seeded, databaseSeedTargetName(target))
@@ -187,7 +193,7 @@ func anonymizeSQL(sql string) string {
 	return sql
 }
 
-func (a *Activities) createDatabaseSeedJob(ctx context.Context, namespace, scanID string, target DatabaseSchema, sql string) error {
+func (a *Activities) createDatabaseSeedJob(ctx context.Context, namespace, scanID string, target DatabaseSchema, sql string) (string, error) {
 	name := kubernetesName("db-seed-" + databaseSeedTargetName(target))
 	if len(name) > 50 {
 		name = kubernetesName("db-seed-" + target.DatabaseName)
@@ -200,7 +206,7 @@ func (a *Activities) createDatabaseSeedJob(ctx context.Context, namespace, scanI
 		},
 	}
 	if _, err := a.k8s.CoreV1().ConfigMaps(namespace).Create(ctx, configMap, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create database seed configmap %s/%s: %w", namespace, configMap.Name, err)
+		return "", fmt.Errorf("create database seed configmap %s/%s: %w", namespace, configMap.Name, err)
 	}
 	backoff := int32(1)
 	job := &batchv1.Job{
@@ -232,9 +238,33 @@ func (a *Activities) createDatabaseSeedJob(ctx context.Context, namespace, scanI
 		},
 	}
 	if _, err := a.k8s.BatchV1().Jobs(namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create database seed job %s/%s: %w", namespace, job.Name, err)
+		return "", fmt.Errorf("create database seed job %s/%s: %w", namespace, job.Name, err)
 	}
-	return nil
+	return job.Name, nil
+}
+
+func (a *Activities) waitForDatabaseSeedJob(ctx context.Context, namespace, name string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return wait.PollUntilContextCancel(ctx, 500*time.Millisecond, true, func(ctx context.Context) (bool, error) {
+		job, err := a.k8s.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		for _, condition := range job.Status.Conditions {
+			switch condition.Type {
+			case batchv1.JobComplete:
+				if condition.Status == corev1.ConditionTrue {
+					return true, nil
+				}
+			case batchv1.JobFailed:
+				if condition.Status == corev1.ConditionTrue {
+					return false, fmt.Errorf("database seed job %s/%s failed: %s", namespace, name, firstNonEmpty(condition.Message, condition.Reason, "unknown failure"))
+				}
+			}
+		}
+		return false, nil
+	})
 }
 
 func databaseSeedTargetName(target DatabaseSchema) string {

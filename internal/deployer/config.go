@@ -31,4 +31,5 @@ var (
 	temporalConnectMaxAttempts     = 0
 	temporalConnectRetryDelay      = 2 * time.Second
 	topologyDeploymentReadyTimeout = 60 * time.Second
+	databaseSeedJobReadyTimeout    = 90 * time.Second
 )

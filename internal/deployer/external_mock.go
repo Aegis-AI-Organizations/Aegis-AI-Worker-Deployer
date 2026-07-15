@@ -3,6 +3,7 @@ package deployer
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
@@ -19,6 +20,7 @@ import (
 )
 
 func (a *Activities) createExternalDependencyMock(ctx context.Context, namespace, scanID string, scenarios []ExternalMockScenario) (string, error) {
+	scenarios = normalizeExternalMockScenarios(scenarios)
 	mockIP, err := a.createExternalMockService(ctx, namespace, scanID)
 	if err != nil {
 		return "", err
@@ -368,14 +370,90 @@ func nginxLuaLatencySeconds(value string) string {
 }
 
 func externalMockScenariosJSON(scenarios []ExternalMockScenario) string {
-	if len(scenarios) == 0 {
+	data, err := json.MarshalIndent(normalizeExternalMockScenarios(scenarios), "", "  ")
+	if err != nil {
 		return "[]"
 	}
-	parts := make([]string, 0, len(scenarios))
-	for _, scenario := range scenarios {
-		parts = append(parts, fmt.Sprintf("%s:%d", strings.TrimSpace(scenario.Host), len(scenario.Routes)))
+	return string(data)
+}
+
+func normalizeExternalMockScenarios(scenarios []ExternalMockScenario) []ExternalMockScenario {
+	if len(scenarios) > 0 {
+		return scenarios
 	}
-	return strings.Join(parts, "\n")
+	return defaultExternalMockScenarios()
+}
+
+func defaultExternalMockScenarios() []ExternalMockScenario {
+	jsonHeader := map[string]string{"Content-Type": "application/json"}
+	return []ExternalMockScenario{
+		{
+			Host: "api.stripe.com",
+			Routes: []ExternalMockRoute{{
+				Method:  "POST",
+				Path:    "/v1/payment_intents",
+				Status:  200,
+				Headers: jsonHeader,
+				Body:    `{"id":"pi_aegis_mock","object":"payment_intent","status":"succeeded","client_secret":"aegis-mock-secret"}`,
+			}},
+			Capture: true,
+		},
+		{
+			Host: "oauth2.googleapis.com",
+			Routes: []ExternalMockRoute{{
+				Method:  "POST",
+				Path:    "/token",
+				Status:  200,
+				Headers: jsonHeader,
+				Body:    `{"access_token":"aegis-mock-token","token_type":"Bearer","expires_in":3600}`,
+			}},
+			Capture: true,
+		},
+		{
+			Host: "accounts.google.com",
+			Routes: []ExternalMockRoute{{
+				Method:  "GET",
+				Path:    "/.well-known/openid-configuration",
+				Status:  200,
+				Headers: jsonHeader,
+				Body:    `{"issuer":"https://accounts.google.com","token_endpoint":"https://oauth2.googleapis.com/token","jwks_uri":"https://www.googleapis.com/oauth2/v3/certs"}`,
+			}},
+			Capture: true,
+		},
+		{
+			Host: "s3.amazonaws.com",
+			Routes: []ExternalMockRoute{{
+				Method:  "GET",
+				Path:    "/aegis-mock-bucket",
+				Status:  200,
+				Headers: map[string]string{"Content-Type": "application/xml"},
+				Body:    `<ListBucketResult><Name>aegis-mock-bucket</Name><Contents><Key>seed/object.json</Key></Contents></ListBucketResult>`,
+			}},
+			Capture: true,
+		},
+		{
+			Host: "hooks.slack.com",
+			Routes: []ExternalMockRoute{{
+				Method:  "POST",
+				Path:    "/services/aegis/mock",
+				Status:  200,
+				Headers: map[string]string{"Content-Type": "text/plain"},
+				Body:    "ok",
+			}},
+			Capture: true,
+		},
+		{
+			Host: "api.github.com",
+			Routes: []ExternalMockRoute{{
+				Method:  "GET",
+				Path:    "/user",
+				Status:  200,
+				Headers: jsonHeader,
+				Body:    `{"login":"aegis-mock-user","id":1001,"type":"User"}`,
+			}},
+			Capture: true,
+		},
+	}
 }
 
 func (a *Activities) createExternalMockTrafficConfigMap(ctx context.Context, namespace, scanID string) error {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
@@ -1994,6 +1995,20 @@ func TestSeedTargetDatabasesCreatesAnonymizedSeedJob(t *testing.T) {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "aegis-war-room-scan-1"}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: sandboxDebugBundleName("scan-1"), Namespace: "aegis-war-room-scan-1"}},
 	)
+	var createdJob *batchv1.Job
+	k8s.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		createdJob = createAction.GetObject().(*batchv1.Job)
+		return true, createdJob, nil
+	})
+	k8s.PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if createdJob == nil {
+			return false, nil, nil
+		}
+		job := createdJob.DeepCopy()
+		job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+		return true, job, nil
+	})
 	activities := NewActivities(k8s)
 
 	response, err := activities.SeedTargetDatabases(ctx, SeedDatabaseRequest{
@@ -2086,12 +2101,46 @@ func TestCreateSandboxConfiguresExternalMockScenariosAndDebugBundle(t *testing.T
 	if !strings.Contains(contract, "api.stripe.com") || !strings.Contains(contract, "web") {
 		t.Fatalf("expected mock data contract to describe workloads and external services, got %s", contract)
 	}
+	state := debugBundle.Data["kubernetes_state.json"]
+	if !strings.Contains(state, "services") || !strings.Contains(state, "deployments") || !strings.Contains(state, "pods") {
+		t.Fatalf("expected Kubernetes state debug bundle, got %s", state)
+	}
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(contract), &parsed); err != nil {
 		t.Fatalf("expected valid mock data contract JSON: %v", err)
 	}
+	if err := json.Unmarshal([]byte(state), &parsed); err != nil {
+		t.Fatalf("expected valid Kubernetes state JSON: %v", err)
+	}
 	if _, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, externalMockTrafficConfigMapName("scan-1"), metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected traffic bundle configmap: %v", err)
+	}
+}
+
+func TestExternalMockDefaultScenariosCoverCommonServices(t *testing.T) {
+	scenarios := defaultExternalMockScenarios()
+	config := externalMockNginxConfig(scenarios)
+	for _, want := range []string{
+		"api.stripe.com",
+		"/v1/payment_intents",
+		"oauth2.googleapis.com",
+		"/token",
+		"s3.amazonaws.com",
+		"/aegis-mock-bucket",
+		"hooks.slack.com",
+		"api.github.com",
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("expected default external mock config to contain %q, got %s", want, config)
+		}
+	}
+	manifest := externalMockScenariosJSON(nil)
+	if !strings.Contains(manifest, "api.stripe.com") || !strings.Contains(manifest, "aegis-mock-bucket") {
+		t.Fatalf("expected default external mock scenarios JSON, got %s", manifest)
+	}
+	var parsed []ExternalMockScenario
+	if err := json.Unmarshal([]byte(manifest), &parsed); err != nil {
+		t.Fatalf("expected valid external mock scenarios JSON: %v", err)
 	}
 }
 
