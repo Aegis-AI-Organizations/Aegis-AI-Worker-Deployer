@@ -130,6 +130,7 @@ type SeedDatabaseResponse struct {
 	Anonymized    bool     `json:"anonymized"`
 	DebugBundle   string   `json:"debug_bundle,omitempty"`
 	TrafficBundle string   `json:"traffic_bundle,omitempty"`
+	SeedContract  string   `json:"seed_contract,omitempty"`
 }
 
 type TopologyWorkload struct {

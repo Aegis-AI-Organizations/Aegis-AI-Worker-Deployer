@@ -2,6 +2,7 @@ package deployer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -1989,7 +1990,10 @@ func TestRun_TemporalConnectionFailureAndSuccess(t *testing.T) {
 
 func TestSeedTargetDatabasesCreatesAnonymizedSeedJob(t *testing.T) {
 	ctx := context.Background()
-	k8s := fake.NewSimpleClientset(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "aegis-war-room-scan-1"}})
+	k8s := fake.NewSimpleClientset(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "aegis-war-room-scan-1"}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: sandboxDebugBundleName("scan-1"), Namespace: "aegis-war-room-scan-1"}},
+	)
 	activities := NewActivities(k8s)
 
 	response, err := activities.SeedTargetDatabases(ctx, SeedDatabaseRequest{
@@ -2007,7 +2011,7 @@ func TestSeedTargetDatabasesCreatesAnonymizedSeedJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SeedTargetDatabases returned error: %v", err)
 	}
-	if !response.Anonymized || response.SeededCount != 1 {
+	if !response.Anonymized || response.SeededCount != 1 || response.SeedContract == "" {
 		t.Fatalf("unexpected seed response: %#v", response)
 	}
 	configMap, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, "db-seed-app-sql", metav1.GetOptions{})
@@ -2029,6 +2033,26 @@ func TestSeedTargetDatabasesCreatesAnonymizedSeedJob(t *testing.T) {
 	}
 	if job.Spec.Template.Spec.Containers[0].Env[0].Name != "PGHOST" {
 		t.Fatalf("expected psql env vars, got %#v", job.Spec.Template.Spec.Containers[0].Env)
+	}
+	debugBundle, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, sandboxDebugBundleName("scan-1"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected debug bundle: %v", err)
+	}
+	seedContract := debugBundle.Data["seed_contract.json"]
+	if !strings.Contains(seedContract, "\"seeded_targets\"") || !strings.Contains(seedContract, "api_tokens") {
+		t.Fatalf("expected seed contract with seeded targets and mock tables, got %s", seedContract)
+	}
+	if strings.Contains(seedContract, "real-password") {
+		t.Fatalf("seed contract leaked database password: %s", seedContract)
+	}
+}
+
+func TestSyntheticSeedSQLIncludesRealisticMockData(t *testing.T) {
+	seedSQL := syntheticSeedSQL("flag-1")
+	for _, want := range []string{"api_tokens", "projects", "audit_events", "app_settings", "service-account@example.test", "sk_test_aegis_mock", "aegis-mock-secret"} {
+		if !strings.Contains(seedSQL, want) {
+			t.Fatalf("expected synthetic seed SQL to contain %q, got %s", want, seedSQL)
+		}
 	}
 }
 
@@ -2054,8 +2078,17 @@ func TestCreateSandboxConfiguresExternalMockScenariosAndDebugBundle(t *testing.T
 	if !strings.Contains(mockConfig.Data["default.conf"], "location = /oauth/token") || !strings.Contains(mockConfig.Data["default.conf"], "api.stripe.com") {
 		t.Fatalf("expected scripted external mock route, got %s", mockConfig.Data["default.conf"])
 	}
-	if _, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, sandboxDebugBundleName("scan-1"), metav1.GetOptions{}); err != nil {
+	debugBundle, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, sandboxDebugBundleName("scan-1"), metav1.GetOptions{})
+	if err != nil {
 		t.Fatalf("expected debug bundle configmap: %v", err)
+	}
+	contract := debugBundle.Data["mock_data_contract.json"]
+	if !strings.Contains(contract, "api.stripe.com") || !strings.Contains(contract, "web") {
+		t.Fatalf("expected mock data contract to describe workloads and external services, got %s", contract)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(contract), &parsed); err != nil {
+		t.Fatalf("expected valid mock data contract JSON: %v", err)
 	}
 	if _, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, externalMockTrafficConfigMapName("scan-1"), metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected traffic bundle configmap: %v", err)

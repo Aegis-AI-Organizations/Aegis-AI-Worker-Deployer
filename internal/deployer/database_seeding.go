@@ -2,6 +2,7 @@ package deployer
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
@@ -57,6 +58,9 @@ func (a *Activities) SeedTargetDatabases(ctx context.Context, req SeedDatabaseRe
 		seeded = append(seeded, databaseSeedTargetName(target))
 	}
 	sort.Strings(seeded)
+	if err := a.updateSeedDebugContract(ctx, namespace, req.ScanID, targets, seeded, req.SeedFlag); err != nil {
+		return SeedDatabaseResponse{}, err
+	}
 	return SeedDatabaseResponse{
 		Namespace:     namespace,
 		Seeded:        seeded,
@@ -65,6 +69,7 @@ func (a *Activities) SeedTargetDatabases(ctx context.Context, req SeedDatabaseRe
 		Anonymized:    true,
 		DebugBundle:   fmt.Sprintf("configmap/%s", sandboxDebugBundleName(req.ScanID)),
 		TrafficBundle: fmt.Sprintf("configmap/%s", externalMockTrafficConfigMapName(req.ScanID)),
+		SeedContract:  fmt.Sprintf("configmap/%s#seed_contract.json", sandboxDebugBundleName(req.ScanID)),
 	}, nil
 }
 
@@ -114,14 +119,59 @@ CREATE TABLE IF NOT EXISTS credentials (
     password TEXT NOT NULL,
     seed_flag TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id SERIAL PRIMARY KEY,
+    owner_email TEXT NOT NULL UNIQUE,
+    token_name TEXT NOT NULL,
+    token_value TEXT NOT NULL,
+    scopes TEXT NOT NULL,
+    seed_flag TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS projects (
+    id SERIAL PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    owner_email TEXT NOT NULL,
+    visibility TEXT NOT NULL,
+    seed_flag TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_events (
+    id SERIAL PRIMARY KEY,
+    actor_email TEXT NOT NULL,
+    action TEXT NOT NULL,
+    ip_address TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    seed_flag TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    seed_flag TEXT NOT NULL
+);
 INSERT INTO users (email, password, role, seed_flag) VALUES
     ('admin@example.test', 'aegis-mock-secret', 'admin', '%s'),
-    ('analyst@example.test', 'aegis-mock-secret', 'user', '%s')
+    ('analyst@example.test', 'aegis-mock-secret', 'user', '%s'),
+    ('service-account@example.test', 'aegis-mock-secret', 'service', '%s')
 ON CONFLICT (email) DO UPDATE SET password = EXCLUDED.password, role = EXCLUDED.role, seed_flag = EXCLUDED.seed_flag;
 INSERT INTO credentials (owner_email, service_name, username, password, seed_flag) VALUES
-    ('admin@example.test', 'internal-admin', 'admin', 'aegis-mock-secret', '%s')
+    ('admin@example.test', 'internal-admin', 'admin', 'aegis-mock-secret', '%s'),
+    ('analyst@example.test', 'staging-s3', 'analyst', 'aegis-mock-secret', '%s')
 ON CONFLICT (owner_email) DO UPDATE SET service_name = EXCLUDED.service_name, username = EXCLUDED.username, password = EXCLUDED.password, seed_flag = EXCLUDED.seed_flag;
-`, seedFlag, seedFlag, seedFlag)
+INSERT INTO api_tokens (owner_email, token_name, token_value, scopes, seed_flag) VALUES
+    ('service-account@example.test', 'ci-runner', 'sk_test_aegis_mock', 'read:projects,write:artifacts', '%s')
+ON CONFLICT (owner_email) DO UPDATE SET token_name = EXCLUDED.token_name, token_value = EXCLUDED.token_value, scopes = EXCLUDED.scopes, seed_flag = EXCLUDED.seed_flag;
+INSERT INTO projects (slug, owner_email, visibility, seed_flag) VALUES
+    ('customer-portal', 'admin@example.test', 'private', '%s'),
+    ('internal-runbook', 'analyst@example.test', 'internal', '%s')
+ON CONFLICT (slug) DO UPDATE SET owner_email = EXCLUDED.owner_email, visibility = EXCLUDED.visibility, seed_flag = EXCLUDED.seed_flag;
+INSERT INTO audit_events (actor_email, action, ip_address, metadata, seed_flag) VALUES
+    ('admin@example.test', 'login.success', '198.51.100.10', '{"user_agent":"aegis-mock-browser"}'::jsonb, '%s'),
+    ('service-account@example.test', 'token.used', '203.0.113.25', '{"token_name":"ci-runner"}'::jsonb, '%s');
+INSERT INTO app_settings (key, value, seed_flag) VALUES
+    ('smtp.host', 'smtp.mock.aegis.test', '%s'),
+    ('stripe.webhook_secret', 'aegis-mock-secret', '%s'),
+    ('oauth.client_secret', 'aegis-mock-secret', '%s')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, seed_flag = EXCLUDED.seed_flag;
+`, seedFlag, seedFlag, seedFlag, seedFlag, seedFlag, seedFlag, seedFlag, seedFlag, seedFlag, seedFlag, seedFlag, seedFlag, seedFlag)
 }
 
 func anonymizeSQL(sql string) string {
@@ -189,6 +239,72 @@ func (a *Activities) createDatabaseSeedJob(ctx context.Context, namespace, scanI
 
 func databaseSeedTargetName(target DatabaseSchema) string {
 	return firstNonEmpty(target.DatabaseName, target.SourceContainerName, target.Host, "postgres")
+}
+
+func (a *Activities) updateSeedDebugContract(ctx context.Context, namespace, scanID string, targets []DatabaseSchema, seeded []string, seedFlag string) error {
+	name := sandboxDebugBundleName(scanID)
+	configMap, err := a.k8s.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get sandbox debug bundle %s/%s: %w", namespace, name, err)
+	}
+	if configMap.Data == nil {
+		configMap.Data = map[string]string{}
+	}
+	contract := map[string]any{
+		"version":        "2026-07-15",
+		"scan_id":        scanID,
+		"namespace":      namespace,
+		"seed_flag":      seedFlag,
+		"seeded_targets": seeded,
+		"tables": []string{
+			"users",
+			"credentials",
+			"api_tokens",
+			"projects",
+			"audit_events",
+			"app_settings",
+		},
+		"personas": []map[string]string{
+			{"email": "admin@example.test", "role": "admin", "password": "aegis-mock-secret"},
+			{"email": "analyst@example.test", "role": "user", "password": "aegis-mock-secret"},
+			{"email": "service-account@example.test", "role": "service", "password": "aegis-mock-secret"},
+		},
+		"database_targets": sanitizeDatabaseSchemas(targets),
+		"crewai_guidance": []string{
+			"Generate only synthetic data marked with seed_flag.",
+			"Keep credentials non-production and use aegis-mock-secret for secret-like values.",
+			"Prefer realistic business objects linked to users, projects, tokens, and audit events.",
+		},
+	}
+	data, err := json.MarshalIndent(contract, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal seed debug contract: %w", err)
+	}
+	configMap.Data["seed_contract.json"] = string(data)
+	if _, err := a.k8s.CoreV1().ConfigMaps(namespace).Update(ctx, configMap, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("update sandbox debug bundle %s/%s: %w", namespace, name, err)
+	}
+	return nil
+}
+
+func sanitizeDatabaseSchemas(schemas []DatabaseSchema) []map[string]any {
+	result := make([]map[string]any, 0, len(schemas))
+	for _, schema := range schemas {
+		result = append(result, map[string]any{
+			"engine":                schema.Engine,
+			"host":                  schema.Host,
+			"port":                  schema.Port,
+			"database_name":         schema.DatabaseName,
+			"username":              schema.Username,
+			"source_container_id":   schema.SourceContainerID,
+			"source_container_name": schema.SourceContainerName,
+			"tables":                schema.Tables,
+		})
+	}
+	return result
 }
 
 func firstNonEmpty(values ...string) string {
