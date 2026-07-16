@@ -22,6 +22,7 @@ const (
 	externalMockDNSPort      = int32(53)
 	fallbackKubeDNSIP        = "10.43.0.10"
 	fallbackExternalMockIP   = "10.43.0.200"
+	defaultAegisRedactImage  = "ghcr.io/aegis-ai-organizations/aegis-ai-agent:latest"
 )
 
 var (
@@ -31,5 +32,5 @@ var (
 	temporalConnectMaxAttempts     = 0
 	temporalConnectRetryDelay      = 2 * time.Second
 	topologyDeploymentReadyTimeout = 60 * time.Second
-	databaseSeedJobReadyTimeout    = 90 * time.Second
+	databaseSeedJobReadyTimeout    = 5 * time.Minute
 )

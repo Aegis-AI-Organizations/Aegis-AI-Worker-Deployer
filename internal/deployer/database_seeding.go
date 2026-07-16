@@ -13,7 +13,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/watch"
 )
 
 const defaultSeedFlag = "aegis-flag-1234"
@@ -209,6 +210,7 @@ func (a *Activities) createDatabaseSeedJob(ctx context.Context, namespace, scanI
 		return "", fmt.Errorf("create database seed configmap %s/%s: %w", namespace, configMap.Name, err)
 	}
 	backoff := int32(1)
+	redactImage := strings.TrimSpace(getenv("AEGIS_REDACT_IMAGE", defaultAegisRedactImage))
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: topologyLabels(scanID, name)},
 		Spec: batchv1.JobSpec{
@@ -217,6 +219,17 @@ func (a *Activities) createDatabaseSeedJob(ctx context.Context, namespace, scanI
 				ObjectMeta: metav1.ObjectMeta{Labels: topologyLabels(scanID, name)},
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
+					InitContainers: []corev1.Container{{
+						Name:            "aegis-redact",
+						Image:           redactImage,
+						ImagePullPolicy: corev1.PullIfNotPresent,
+						Command:         []string{"/aegis-redact"},
+						Args:            []string{"--input", "/aegis-input/seed.sql", "--mode", "sql", "--output", "/aegis/seed.sql"},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "seed-sql-source", MountPath: "/aegis-input/seed.sql", SubPath: "seed.sql", ReadOnly: true},
+							{Name: "seed-sql-redacted", MountPath: "/aegis"},
+						},
+					}},
 					Containers: []corev1.Container{{
 						Name:            "psql",
 						Image:           "postgres:16-alpine",
@@ -230,9 +243,12 @@ func (a *Activities) createDatabaseSeedJob(ctx context.Context, namespace, scanI
 							{Name: "PGUSER", Value: target.Username},
 							{Name: "PGPASSWORD", Value: target.Password},
 						},
-						VolumeMounts: []corev1.VolumeMount{{Name: "seed-sql", MountPath: "/aegis/seed.sql", SubPath: "seed.sql", ReadOnly: true}},
+						VolumeMounts: []corev1.VolumeMount{{Name: "seed-sql-redacted", MountPath: "/aegis"}},
 					}},
-					Volumes: []corev1.Volume{{Name: "seed-sql", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configMap.Name}, DefaultMode: &mode}}}},
+					Volumes: []corev1.Volume{
+						{Name: "seed-sql-source", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configMap.Name}, DefaultMode: &mode}}},
+						{Name: "seed-sql-redacted", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+					},
 				},
 			},
 		},
@@ -246,25 +262,57 @@ func (a *Activities) createDatabaseSeedJob(ctx context.Context, namespace, scanI
 func (a *Activities) waitForDatabaseSeedJob(ctx context.Context, namespace, name string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return wait.PollUntilContextCancel(ctx, 500*time.Millisecond, true, func(ctx context.Context) (bool, error) {
-		job, err := a.k8s.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return false, err
-		}
-		for _, condition := range job.Status.Conditions {
-			switch condition.Type {
-			case batchv1.JobComplete:
-				if condition.Status == corev1.ConditionTrue {
-					return true, nil
-				}
-			case batchv1.JobFailed:
-				if condition.Status == corev1.ConditionTrue {
-					return false, fmt.Errorf("database seed job %s/%s failed: %s", namespace, name, firstNonEmpty(condition.Message, condition.Reason, "unknown failure"))
-				}
+
+	job, err := a.k8s.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("Database Seeding Failed: read job %s/%s: %w", namespace, name, err)
+	}
+	if done, err := databaseSeedJobTerminalError(namespace, job); done || err != nil {
+		return err
+	}
+
+	watcher, err := a.k8s.BatchV1().Jobs(namespace).Watch(ctx, metav1.ListOptions{FieldSelector: fields.OneTermEqualSelector("metadata.name", name).String()})
+	if err != nil {
+		return fmt.Errorf("Database Seeding Failed: watch job %s/%s: %w", namespace, name, err)
+	}
+	defer watcher.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("Database Seeding Failed: timeout waiting for job %s/%s after %s: %w", namespace, name, timeout, ctx.Err())
+		case event, ok := <-watcher.ResultChan():
+			if !ok {
+				return fmt.Errorf("Database Seeding Failed: watch closed before job %s/%s completed", namespace, name)
+			}
+			if event.Type == watch.Error {
+				return fmt.Errorf("Database Seeding Failed: watch error for job %s/%s", namespace, name)
+			}
+			job, ok := event.Object.(*batchv1.Job)
+			if !ok || job.Name != name {
+				continue
+			}
+			if done, err := databaseSeedJobTerminalError(namespace, job); done || err != nil {
+				return err
 			}
 		}
-		return false, nil
-	})
+	}
+}
+
+func databaseSeedJobTerminalError(namespace string, job *batchv1.Job) (bool, error) {
+	for _, condition := range job.Status.Conditions {
+		switch condition.Type {
+		case batchv1.JobComplete:
+			if condition.Status == corev1.ConditionTrue {
+				return true, nil
+			}
+		case batchv1.JobFailed:
+			if condition.Status == corev1.ConditionTrue {
+				return true, fmt.Errorf("Database Seeding Failed: job %s/%s failed: %s", namespace, job.Name, firstNonEmpty(condition.Message, condition.Reason, "unknown failure"))
+			}
+		}
+	}
+	return false, nil
 }
 
 func databaseSeedTargetName(target DatabaseSchema) string {

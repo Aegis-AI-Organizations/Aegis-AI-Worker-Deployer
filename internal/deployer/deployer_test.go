@@ -19,6 +19,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	kwatch "k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -2049,6 +2050,19 @@ func TestSeedTargetDatabasesCreatesAnonymizedSeedJob(t *testing.T) {
 	if job.Spec.Template.Spec.Containers[0].Env[0].Name != "PGHOST" {
 		t.Fatalf("expected psql env vars, got %#v", job.Spec.Template.Spec.Containers[0].Env)
 	}
+	if len(job.Spec.Template.Spec.InitContainers) != 1 {
+		t.Fatalf("expected aegis-redact initContainer, got %#v", job.Spec.Template.Spec.InitContainers)
+	}
+	redactInit := job.Spec.Template.Spec.InitContainers[0]
+	if redactInit.Name != "aegis-redact" || redactInit.Image != defaultAegisRedactImage {
+		t.Fatalf("unexpected redaction initContainer: %#v", redactInit)
+	}
+	if strings.Join(redactInit.Command, " ") != "/aegis-redact" || !strings.Contains(strings.Join(redactInit.Args, " "), "--input /aegis-input/seed.sql --mode sql --output /aegis/seed.sql") {
+		t.Fatalf("expected initContainer to run aegis-redact directly, got command=%#v args=%#v", redactInit.Command, redactInit.Args)
+	}
+	if job.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name != "seed-sql-redacted" {
+		t.Fatalf("expected psql to mount redacted seed volume, got %#v", job.Spec.Template.Spec.Containers[0].VolumeMounts)
+	}
 	debugBundle, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, sandboxDebugBundleName("scan-1"), metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("expected debug bundle: %v", err)
@@ -2059,6 +2073,52 @@ func TestSeedTargetDatabasesCreatesAnonymizedSeedJob(t *testing.T) {
 	}
 	if strings.Contains(seedContract, "real-password") {
 		t.Fatalf("seed contract leaked database password: %s", seedContract)
+	}
+}
+
+func TestWaitForDatabaseSeedJobUsesWatcherUntilComplete(t *testing.T) {
+	ctx := context.Background()
+	k8s := fake.NewSimpleClientset(&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "db-seed-app", Namespace: "aegis-war-room-scan-1"}})
+	fakeWatcher := kwatch.NewFake()
+	k8s.PrependWatchReactor("jobs", k8stesting.DefaultWatchReactor(fakeWatcher, nil))
+	activities := NewActivities(k8s)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- activities.waitForDatabaseSeedJob(ctx, "aegis-war-room-scan-1", "db-seed-app", time.Second)
+	}()
+
+	fakeWatcher.Modify(&batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "db-seed-app", Namespace: "aegis-war-room-scan-1"},
+		Status:     batchv1.JobStatus{Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}},
+	})
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected watcher completion without error, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for seed job watcher")
+	}
+}
+
+func TestWaitForDatabaseSeedJobFailsFastOnFailedCondition(t *testing.T) {
+	ctx := context.Background()
+	k8s := fake.NewSimpleClientset(&batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "db-seed-app", Namespace: "aegis-war-room-scan-1"},
+		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+			Type:    batchv1.JobFailed,
+			Status:  corev1.ConditionTrue,
+			Reason:  "BackoffLimitExceeded",
+			Message: "psql restore failed",
+		}}},
+	})
+	activities := NewActivities(k8s)
+
+	err := activities.waitForDatabaseSeedJob(ctx, "aegis-war-room-scan-1", "db-seed-app", time.Second)
+	if err == nil || !strings.Contains(err.Error(), "Database Seeding Failed") || !strings.Contains(err.Error(), "psql restore failed") {
+		t.Fatalf("expected explicit database seeding failure, got %v", err)
 	}
 }
 
