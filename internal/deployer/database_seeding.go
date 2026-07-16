@@ -17,7 +17,10 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 )
 
-const defaultSeedFlag = "aegis-flag-1234"
+const (
+	defaultSeedFlag           = "aegis-flag-1234"
+	databaseSeedFailurePrefix = "Database Seeding Failed"
+)
 
 var (
 	emailPattern      = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
@@ -265,7 +268,7 @@ func (a *Activities) waitForDatabaseSeedJob(ctx context.Context, namespace, name
 
 	job, err := a.k8s.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("Database Seeding Failed: read job %s/%s: %w", namespace, name, err)
+		return databaseSeedFailuref("read job %s/%s: %w", namespace, name, err)
 	}
 	if done, err := databaseSeedJobTerminalError(namespace, job); done || err != nil {
 		return err
@@ -273,20 +276,20 @@ func (a *Activities) waitForDatabaseSeedJob(ctx context.Context, namespace, name
 
 	watcher, err := a.k8s.BatchV1().Jobs(namespace).Watch(ctx, metav1.ListOptions{FieldSelector: fields.OneTermEqualSelector("metadata.name", name).String()})
 	if err != nil {
-		return fmt.Errorf("Database Seeding Failed: watch job %s/%s: %w", namespace, name, err)
+		return databaseSeedFailuref("watch job %s/%s: %w", namespace, name, err)
 	}
 	defer watcher.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("Database Seeding Failed: timeout waiting for job %s/%s after %s: %w", namespace, name, timeout, ctx.Err())
+			return databaseSeedFailuref("timeout waiting for job %s/%s after %s: %w", namespace, name, timeout, ctx.Err())
 		case event, ok := <-watcher.ResultChan():
 			if !ok {
-				return fmt.Errorf("Database Seeding Failed: watch closed before job %s/%s completed", namespace, name)
+				return databaseSeedFailuref("watch closed before job %s/%s completed", namespace, name)
 			}
 			if event.Type == watch.Error {
-				return fmt.Errorf("Database Seeding Failed: watch error for job %s/%s", namespace, name)
+				return databaseSeedFailuref("watch error for job %s/%s", namespace, name)
 			}
 			job, ok := event.Object.(*batchv1.Job)
 			if !ok || job.Name != name {
@@ -308,11 +311,15 @@ func databaseSeedJobTerminalError(namespace string, job *batchv1.Job) (bool, err
 			}
 		case batchv1.JobFailed:
 			if condition.Status == corev1.ConditionTrue {
-				return true, fmt.Errorf("Database Seeding Failed: job %s/%s failed: %s", namespace, job.Name, firstNonEmpty(condition.Message, condition.Reason, "unknown failure"))
+				return true, databaseSeedFailuref("job %s/%s failed: %s", namespace, job.Name, firstNonEmpty(condition.Message, condition.Reason, "unknown failure"))
 			}
 		}
 	}
 	return false, nil
+}
+
+func databaseSeedFailuref(format string, args ...any) error {
+	return fmt.Errorf("%s: "+format, append([]any{databaseSeedFailurePrefix}, args...)...)
 }
 
 func databaseSeedTargetName(target DatabaseSchema) string {
