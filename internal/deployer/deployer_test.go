@@ -2271,7 +2271,11 @@ func tarGzipEntries(t *testing.T, archive []byte) map[string][]byte {
 	if err != nil {
 		t.Fatalf("open gzip archive: %v", err)
 	}
-	defer gzipReader.Close()
+	defer func() {
+		if err := gzipReader.Close(); err != nil {
+			t.Fatalf("close gzip archive: %v", err)
+		}
+	}()
 	tarReader := tar.NewReader(gzipReader)
 	entries := map[string][]byte{}
 	for {
