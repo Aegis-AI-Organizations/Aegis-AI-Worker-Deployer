@@ -1,21 +1,55 @@
 package deployer
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
-func (a *Activities) createSandboxDebugBundle(ctx context.Context, namespace, scanID string, response SandboxResponse, topology *SandboxTopology) error {
+var (
+	readSandboxPodLog        = defaultReadSandboxPodLog
+	uploadSandboxDebugBundle = uploadSandboxDebugBundleArchive
+)
+
+func (a *Activities) createSandboxDebugBundle(ctx context.Context, namespace, scanID string, response SandboxResponse, topology *SandboxTopology) (string, error) {
+	files := a.collectSandboxDebugFiles(ctx, namespace, scanID, response, topology)
+	archive, err := buildDebugBundleArchive(files)
+	if err != nil {
+		return "", err
+	}
+	debugRef := fmt.Sprintf("configmap/%s", sandboxDebugBundleName(scanID))
+	if uploadedRef, err := uploadSandboxDebugBundle(ctx, scanID, archive); err == nil && strings.TrimSpace(uploadedRef) != "" {
+		debugRef = uploadedRef
+	} else if err != nil {
+		log.Printf("[DebugBundle] scan=%s upload skipped: %v", scanID, err)
+	}
+	if err := a.createSandboxDebugConfigMap(ctx, namespace, scanID, debugRef, files); err != nil {
+		return debugRef, err
+	}
+	return debugRef, nil
+}
+
+func (a *Activities) collectSandboxDebugFiles(ctx context.Context, namespace, scanID string, response SandboxResponse, topology *SandboxTopology) map[string][]byte {
+	files := map[string][]byte{}
 	topologyJSON := "{}"
 	if topology != nil {
 		if data, err := json.MarshalIndent(topology, "", "  "); err == nil {
@@ -26,26 +60,237 @@ func (a *Activities) createSandboxDebugBundle(ctx context.Context, namespace, sc
 	if data, err := json.MarshalIndent(response, "", "  "); err == nil {
 		responseJSON = string(data)
 	}
+	files["metadata/created_at.txt"] = []byte(time.Now().UTC().Format(time.RFC3339) + "\n")
+	files["metadata/namespace.txt"] = []byte(namespace + "\n")
+	files["sandbox.json"] = []byte(responseJSON)
+	files["topology.json"] = []byte(topologyJSON)
+	files["kubernetes/state.json"] = []byte(a.sandboxKubernetesState(ctx, namespace))
+	files["contracts/mock_data_contract.json"] = []byte(sandboxMockDataContract(namespace, scanID, topology))
+	files["contracts/traffic_bundle.txt"] = []byte(fmt.Sprintf("configmap/%s\n", externalMockTrafficConfigMapName(scanID)))
+	a.collectExistingDebugContracts(ctx, namespace, scanID, files)
+	a.collectSandboxEvents(ctx, namespace, files)
+	a.collectSandboxPodLogs(ctx, namespace, files)
+	a.collectSandboxSeedErrors(ctx, namespace, files)
+	return files
+}
+
+func (a *Activities) collectExistingDebugContracts(ctx context.Context, namespace, scanID string, files map[string][]byte) {
+	configMap, err := a.k8s.CoreV1().ConfigMaps(namespace).Get(ctx, sandboxDebugBundleName(scanID), metav1.GetOptions{})
+	if err != nil || configMap.Data == nil {
+		return
+	}
+	for key, value := range configMap.Data {
+		switch key {
+		case "seed_contract.json":
+			files["contracts/seed_contract.json"] = []byte(value)
+		}
+	}
+}
+
+func (a *Activities) createSandboxDebugConfigMap(ctx context.Context, namespace, scanID, debugRef string, files map[string][]byte) error {
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   sandboxDebugBundleName(scanID),
 			Labels: map[string]string{"app.kubernetes.io/managed-by": "aegis-worker-deployer", "aegis-scan": scanID},
 		},
 		Data: map[string]string{
-			"created_at":              time.Now().UTC().Format(time.RFC3339),
+			"created_at":              strings.TrimSpace(string(files["metadata/created_at.txt"])),
 			"namespace":               namespace,
-			"sandbox.json":            responseJSON,
-			"topology.json":           topologyJSON,
-			"kubernetes_state.json":   a.sandboxKubernetesState(ctx, namespace),
-			"mock_data_contract.json": sandboxMockDataContract(namespace, scanID, topology),
+			"debug_bundle":            debugRef,
+			"sandbox.json":            string(files["sandbox.json"]),
+			"topology.json":           string(files["topology.json"]),
+			"kubernetes_state.json":   string(files["kubernetes/state.json"]),
+			"kubernetes_events.json":  string(files["kubernetes/events.json"]),
+			"mock_data_contract.json": string(files["contracts/mock_data_contract.json"]),
 			"traffic_bundle":          fmt.Sprintf("configmap/%s", externalMockTrafficConfigMapName(scanID)),
 		},
 	}
+	if seedContract, ok := files["contracts/seed_contract.json"]; ok {
+		configMap.Data["seed_contract.json"] = string(seedContract)
+	}
 	_, err := a.k8s.CoreV1().ConfigMaps(namespace).Create(ctx, configMap, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
-		return nil
+		current, getErr := a.k8s.CoreV1().ConfigMaps(namespace).Get(ctx, configMap.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return getErr
+		}
+		if current.Data == nil {
+			current.Data = map[string]string{}
+		}
+		for key, value := range configMap.Data {
+			current.Data[key] = value
+		}
+		_, updateErr := a.k8s.CoreV1().ConfigMaps(namespace).Update(ctx, current, metav1.UpdateOptions{})
+		return updateErr
 	}
 	return err
+}
+
+func (a *Activities) collectSandboxEvents(ctx context.Context, namespace string, files map[string][]byte) {
+	events, err := a.k8s.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		files["kubernetes/events.error.txt"] = []byte(err.Error() + "\n")
+		return
+	}
+	sort.SliceStable(events.Items, func(i, j int) bool {
+		return events.Items[i].LastTimestamp.Time.Before(events.Items[j].LastTimestamp.Time)
+	})
+	data, err := json.MarshalIndent(events.Items, "", "  ")
+	if err != nil {
+		files["kubernetes/events.error.txt"] = []byte(err.Error() + "\n")
+		return
+	}
+	files["kubernetes/events.json"] = data
+}
+
+func (a *Activities) collectSandboxPodLogs(ctx context.Context, namespace string, files map[string][]byte) {
+	pods, err := a.k8s.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		files["logs/pods.error.txt"] = []byte(err.Error() + "\n")
+		return
+	}
+	sort.SliceStable(pods.Items, func(i, j int) bool { return pods.Items[i].Name < pods.Items[j].Name })
+	for _, pod := range pods.Items {
+		for _, container := range allPodContainerNames(pod) {
+			path := filepath.ToSlash(filepath.Join("logs", "pods", pod.Name, container+".log"))
+			data, err := safeReadSandboxPodLog(ctx, a.k8s, namespace, pod.Name, container, false)
+			if err != nil {
+				files[path+".error.txt"] = []byte(err.Error() + "\n")
+			} else {
+				files[path] = data
+			}
+			previousPath := filepath.ToSlash(filepath.Join("logs", "pods", pod.Name, container+".previous.log"))
+			if data, err := safeReadSandboxPodLog(ctx, a.k8s, namespace, pod.Name, container, true); err == nil && len(data) > 0 {
+				files[previousPath] = data
+			}
+		}
+	}
+}
+
+func safeReadSandboxPodLog(ctx context.Context, k8s kubernetes.Interface, namespace, pod, container string, previous bool) (data []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("read pod logs panic: %v", recovered)
+		}
+	}()
+	return readSandboxPodLog(ctx, k8s, namespace, pod, container, previous)
+}
+
+func allPodContainerNames(pod corev1.Pod) []string {
+	names := make([]string, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers)+len(pod.Spec.EphemeralContainers))
+	for _, container := range pod.Spec.InitContainers {
+		names = append(names, container.Name)
+	}
+	for _, container := range pod.Spec.Containers {
+		names = append(names, container.Name)
+	}
+	for _, container := range pod.Spec.EphemeralContainers {
+		names = append(names, container.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func defaultReadSandboxPodLog(ctx context.Context, k8s kubernetes.Interface, namespace, pod, container string, previous bool) ([]byte, error) {
+	return k8s.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{Container: container, Previous: previous}).DoRaw(ctx)
+}
+
+func (a *Activities) collectSandboxSeedErrors(ctx context.Context, namespace string, files map[string][]byte) {
+	jobs, err := a.k8s.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		files["seeding/errors.error.txt"] = []byte(err.Error() + "\n")
+		return
+	}
+	seedErrors := make([]map[string]string, 0)
+	for _, job := range jobs.Items {
+		if !strings.HasPrefix(job.Name, "db-seed-") {
+			continue
+		}
+		for _, condition := range job.Status.Conditions {
+			if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+				seedErrors = append(seedErrors, map[string]string{
+					"job":     job.Name,
+					"reason":  condition.Reason,
+					"message": condition.Message,
+				})
+			}
+		}
+	}
+	data, err := json.MarshalIndent(seedErrors, "", "  ")
+	if err != nil {
+		files["seeding/errors.error.txt"] = []byte(err.Error() + "\n")
+		return
+	}
+	files["seeding/errors.json"] = data
+}
+
+func buildDebugBundleArchive(files map[string][]byte) ([]byte, error) {
+	var buffer bytes.Buffer
+	gzipWriter := gzip.NewWriter(&buffer)
+	tarWriter := tar.NewWriter(gzipWriter)
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, filepath.ToSlash(filepath.Clean(name)))
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if name == "." || strings.HasPrefix(name, "../") || strings.HasPrefix(name, "/") {
+			return nil, fmt.Errorf("invalid debug bundle path %q", name)
+		}
+		data := files[name]
+		header := &tar.Header{Name: name, Mode: 0o600, Size: int64(len(data)), ModTime: time.Now().UTC()}
+		if err := tarWriter.WriteHeader(header); err != nil {
+			return nil, err
+		}
+		if _, err := tarWriter.Write(data); err != nil {
+			return nil, err
+		}
+	}
+	if err := tarWriter.Close(); err != nil {
+		return nil, err
+	}
+	if err := gzipWriter.Close(); err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
+}
+
+func uploadSandboxDebugBundleArchive(ctx context.Context, scanID string, archive []byte) (string, error) {
+	endpoint := strings.TrimSpace(os.Getenv("MINIO_ENDPOINT"))
+	if endpoint == "" {
+		return "", errors.New("MINIO_ENDPOINT is not configured")
+	}
+	bucket := strings.TrimSpace(os.Getenv("MINIO_DEBUG_BUCKET"))
+	if bucket == "" {
+		bucket = strings.TrimSpace(os.Getenv("MINIO_BUCKET"))
+	}
+	if bucket == "" {
+		bucket = "aegis-debug"
+	}
+	secure := strings.EqualFold(os.Getenv("MINIO_SECURE"), "true")
+	endpoint = strings.TrimPrefix(strings.TrimPrefix(endpoint, "http://"), "https://")
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(os.Getenv("MINIO_ACCESS_KEY"), os.Getenv("MINIO_SECRET_KEY"), ""),
+		Secure: secure,
+	})
+	if err != nil {
+		return "", fmt.Errorf("create MinIO client: %w", err)
+	}
+	exists, err := client.BucketExists(ctx, bucket)
+	if err != nil {
+		return "", fmt.Errorf("check debug bucket %s: %w", bucket, err)
+	}
+	if !exists {
+		if err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
+			return "", fmt.Errorf("create debug bucket %s: %w", bucket, err)
+		}
+	}
+	object := fmt.Sprintf("debug-bundles/%s/%s.tar.gz", kubernetesName(scanID), sandboxDebugBundleName(scanID))
+	_, err = client.PutObject(ctx, bucket, object, bytes.NewReader(archive), int64(len(archive)), minio.PutObjectOptions{ContentType: "application/gzip"})
+	if err != nil {
+		return "", fmt.Errorf("upload debug bundle %s/%s: %w", bucket, object, err)
+	}
+	return fmt.Sprintf("s3://%s/%s", bucket, object), nil
 }
 
 func (a *Activities) sandboxKubernetesState(ctx context.Context, namespace string) string {

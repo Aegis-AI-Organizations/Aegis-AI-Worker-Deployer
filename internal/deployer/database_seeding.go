@@ -71,13 +71,18 @@ func (a *Activities) SeedTargetDatabases(ctx context.Context, req SeedDatabaseRe
 	if err := a.updateSeedDebugContract(ctx, namespace, req.ScanID, targets, seeded, req.SeedFlag); err != nil {
 		return SeedDatabaseResponse{}, err
 	}
+	debugBundle := fmt.Sprintf("configmap/%s", sandboxDebugBundleName(req.ScanID))
+	seedResponse := SandboxResponse{Namespace: namespace, DebugBundle: debugBundle}
+	if debugRef, err := a.createSandboxDebugBundle(ctx, namespace, req.ScanID, seedResponse, nil); err == nil && strings.TrimSpace(debugRef) != "" {
+		debugBundle = debugRef
+	}
 	return SeedDatabaseResponse{
 		Namespace:     namespace,
 		Seeded:        seeded,
 		SeededCount:   len(seeded),
 		SeedFlag:      req.SeedFlag,
 		Anonymized:    true,
-		DebugBundle:   fmt.Sprintf("configmap/%s", sandboxDebugBundleName(req.ScanID)),
+		DebugBundle:   debugBundle,
 		TrafficBundle: fmt.Sprintf("configmap/%s", externalMockTrafficConfigMapName(req.ScanID)),
 		SeedContract:  fmt.Sprintf("configmap/%s#seed_contract.json", sandboxDebugBundleName(req.ScanID)),
 	}, nil

@@ -1,9 +1,13 @@
 package deployer
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2175,6 +2179,116 @@ func TestCreateSandboxConfiguresExternalMockScenariosAndDebugBundle(t *testing.T
 	if _, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, externalMockTrafficConfigMapName("scan-1"), metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected traffic bundle configmap: %v", err)
 	}
+}
+
+func TestSandboxDebugBundleArchivesLogsEventsAndSeedErrors(t *testing.T) {
+	ctx := context.Background()
+	previousReadLog := readSandboxPodLog
+	previousUpload := uploadSandboxDebugBundle
+	defer func() {
+		readSandboxPodLog = previousReadLog
+		uploadSandboxDebugBundle = previousUpload
+	}()
+
+	var uploadedArchive []byte
+	readSandboxPodLog = func(_ context.Context, _ kubernetes.Interface, _, pod, container string, previous bool) ([]byte, error) {
+		if previous {
+			return nil, errors.New("no previous logs")
+		}
+		return []byte("logs for " + pod + "/" + container), nil
+	}
+	uploadSandboxDebugBundle = func(_ context.Context, scanID string, archive []byte) (string, error) {
+		uploadedArchive = append([]byte(nil), archive...)
+		return "s3://aegis-debug/debug-bundles/" + scanID + "/bundle.tar.gz", nil
+	}
+
+	k8s := fake.NewSimpleClientset(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "aegis-war-room-scan-1"}},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "web-pod", Namespace: "aegis-war-room-scan-1"},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}, InitContainers: []corev1.Container{{Name: "init-db"}}},
+		},
+		&corev1.Event{
+			ObjectMeta:     metav1.ObjectMeta{Name: "web-pod.1", Namespace: "aegis-war-room-scan-1"},
+			Type:           corev1.EventTypeWarning,
+			Reason:         "BackOff",
+			Message:        "container failed",
+			InvolvedObject: corev1.ObjectReference{Kind: "Pod", Name: "web-pod"},
+			LastTimestamp:  metav1.Now(),
+			FirstTimestamp: metav1.Now(),
+			Count:          1,
+		},
+		&batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: "db-seed-app", Namespace: "aegis-war-room-scan-1"},
+			Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+				Type:    batchv1.JobFailed,
+				Status:  corev1.ConditionTrue,
+				Reason:  "BackoffLimitExceeded",
+				Message: "psql restore failed",
+			}}},
+		},
+	)
+	activities := NewActivities(k8s)
+
+	debugRef, err := activities.createSandboxDebugBundle(ctx, "aegis-war-room-scan-1", "scan-1", SandboxResponse{Namespace: "aegis-war-room-scan-1"}, &SandboxTopology{Containers: []TopologyWorkload{{Name: "web", Image: "nginx"}}})
+	if err != nil {
+		t.Fatalf("createSandboxDebugBundle returned error: %v", err)
+	}
+	if debugRef != "s3://aegis-debug/debug-bundles/scan-1/bundle.tar.gz" {
+		t.Fatalf("unexpected debug bundle ref: %s", debugRef)
+	}
+	configMap, err := k8s.CoreV1().ConfigMaps("aegis-war-room-scan-1").Get(ctx, sandboxDebugBundleName("scan-1"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected debug bundle configmap: %v", err)
+	}
+	if configMap.Data["debug_bundle"] != debugRef {
+		t.Fatalf("expected configmap to store debug bundle ref, got %#v", configMap.Data)
+	}
+	entries := tarGzipEntries(t, uploadedArchive)
+	for _, want := range []string{
+		"logs/pods/web-pod/app.log",
+		"logs/pods/web-pod/init-db.log",
+		"kubernetes/events.json",
+		"kubernetes/state.json",
+		"seeding/errors.json",
+		"topology.json",
+	} {
+		if _, ok := entries[want]; !ok {
+			t.Fatalf("expected archive entry %q, got entries %#v", want, entries)
+		}
+	}
+	if !strings.Contains(string(entries["logs/pods/web-pod/app.log"]), "logs for web-pod/app") {
+		t.Fatalf("unexpected pod log content: %s", entries["logs/pods/web-pod/app.log"])
+	}
+	if !strings.Contains(string(entries["seeding/errors.json"]), "psql restore failed") {
+		t.Fatalf("expected seed error in archive, got %s", entries["seeding/errors.json"])
+	}
+}
+
+func tarGzipEntries(t *testing.T, archive []byte) map[string][]byte {
+	t.Helper()
+	gzipReader, err := gzip.NewReader(bytes.NewReader(archive))
+	if err != nil {
+		t.Fatalf("open gzip archive: %v", err)
+	}
+	defer gzipReader.Close()
+	tarReader := tar.NewReader(gzipReader)
+	entries := map[string][]byte{}
+	for {
+		header, err := tarReader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read tar entry: %v", err)
+		}
+		data, err := io.ReadAll(tarReader)
+		if err != nil {
+			t.Fatalf("read tar data: %v", err)
+		}
+		entries[header.Name] = data
+	}
+	return entries
 }
 
 func TestExternalMockDefaultScenariosCoverCommonServices(t *testing.T) {

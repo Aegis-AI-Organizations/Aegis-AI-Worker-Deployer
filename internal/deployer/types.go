@@ -21,6 +21,7 @@ type SandboxResponse struct {
 	EndpointWorkload string                   `json:"endpoint_workload,omitempty"`
 	Workloads        []SandboxWorkloadStatus  `json:"workloads,omitempty"`
 	Summary          SandboxDeploymentSummary `json:"summary,omitempty"`
+	DebugBundle      string                   `json:"debug_bundle,omitempty"`
 }
 
 type SandboxWorkloadStatus struct {

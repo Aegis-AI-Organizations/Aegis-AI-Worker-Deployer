@@ -12,7 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (SandboxResponse, error) {
+func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (response SandboxResponse, err error) {
 	req.ScanID = strings.TrimSpace(req.ScanID)
 	req.TargetImage = strings.TrimSpace(req.TargetImage)
 	if req.ScanID == "" {
@@ -30,6 +30,19 @@ func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (San
 	if err := validateSandboxNamespace(namespace); err != nil {
 		return SandboxResponse{}, err
 	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		failureResponse := response
+		failureResponse.Namespace = namespace
+		debugRef, bundleErr := a.createSandboxDebugBundle(ctx, namespace, req.ScanID, failureResponse, topology)
+		if bundleErr != nil {
+			log.Printf("[CreateSandbox] scan=%s debug bundle collection failed after sandbox error: %v", req.ScanID, bundleErr)
+			return
+		}
+		log.Printf("[CreateSandbox] scan=%s debug bundle collected after sandbox error: %s", req.ScanID, debugRef)
+	}()
 
 	podName := "target-" + req.ScanID
 	serviceName := "svc-" + req.ScanID
@@ -53,9 +66,13 @@ func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (San
 	}
 
 	if topology != nil {
-		response, err := a.createTopologySandbox(ctx, req.ScanID, namespace, topology, req.PreferredEndpointWorkload)
+		response, err = a.createTopologySandbox(ctx, req.ScanID, namespace, topology, req.PreferredEndpointWorkload)
 		if err == nil {
-			_ = a.createSandboxDebugBundle(ctx, namespace, req.ScanID, response, topology)
+			if debugRef, bundleErr := a.createSandboxDebugBundle(ctx, namespace, req.ScanID, response, topology); bundleErr == nil {
+				response.DebugBundle = debugRef
+			} else {
+				log.Printf("[CreateSandbox] scan=%s debug bundle collection failed: %v", req.ScanID, bundleErr)
+			}
 		}
 		return response, err
 	}
@@ -84,11 +101,15 @@ func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (San
 
 	endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:80", serviceName, namespace)
 	log.Printf("[CreateSandbox] scan=%s sandbox ready endpoint=%s", req.ScanID, endpoint)
-	response := SandboxResponse{
+	response = SandboxResponse{
 		Namespace: namespace,
 		Endpoint:  endpoint,
 	}
-	_ = a.createSandboxDebugBundle(ctx, namespace, req.ScanID, response, nil)
+	if debugRef, bundleErr := a.createSandboxDebugBundle(ctx, namespace, req.ScanID, response, nil); bundleErr == nil {
+		response.DebugBundle = debugRef
+	} else {
+		log.Printf("[CreateSandbox] scan=%s debug bundle collection failed: %v", req.ScanID, bundleErr)
+	}
 	return response, nil
 }
 
