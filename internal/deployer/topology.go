@@ -346,7 +346,8 @@ func (a *Activities) createTopologySandbox(ctx context.Context, scanID, namespac
 	}
 	mockSecret := mockTopologySecret(scanID)
 	warnAboutLocalImagesWithoutArchives(scanID, orderedWorkloads)
-	if err := importTopologyImageArchives(ctx, orderedWorkloads); err != nil {
+	orderedWorkloads, err = importTopologyImageArchives(ctx, orderedWorkloads)
+	if err != nil {
 		return SandboxResponse{}, err
 	}
 	for i, workload := range orderedWorkloads {
@@ -997,25 +998,32 @@ func isValidEnvName(key string) bool {
 	return key != ""
 }
 
-func importTopologyImageArchives(ctx context.Context, workloads []TopologyWorkload) error {
+func importTopologyImageArchives(ctx context.Context, workloads []TopologyWorkload) ([]TopologyWorkload, error) {
+	remapped := append([]TopologyWorkload(nil), workloads...)
 	imported := map[string]struct{}{}
-	for _, workload := range workloads {
+	for index, workload := range workloads {
+		if !looksLikeLocalImageReference(workload.Image) {
+			continue
+		}
 		archiveRef := strings.TrimSpace(firstNonEmpty(workload.ImageArchiveRef, workload.ImageArchiveObject))
 		if archiveRef == "" {
 			continue
 		}
+		targetImage := remappedTopologyImage(workload)
 		if _, ok := imported[archiveRef]; ok {
+			remapped[index].Image = targetImage
 			continue
 		}
-		if err := importTopologyImageArchive(ctx, workload); err != nil {
-			return err
+		if err := importTopologyImageArchive(ctx, workload, targetImage); err != nil {
+			return nil, err
 		}
+		remapped[index].Image = targetImage
 		imported[archiveRef] = struct{}{}
 	}
-	return nil
+	return remapped, nil
 }
 
-func importTopologyImageArchive(ctx context.Context, workload TopologyWorkload) error {
+func importTopologyImageArchive(ctx context.Context, workload TopologyWorkload, targetImage string) error {
 	objectRef := strings.TrimSpace(firstNonEmpty(workload.ImageArchiveRef, workload.ImageArchiveObject))
 	if objectRef == "" {
 		return nil
@@ -1047,17 +1055,39 @@ func importTopologyImageArchive(ctx context.Context, workload TopologyWorkload) 
 
 	command := strings.TrimSpace(os.Getenv("AEGIS_IMAGE_IMPORT_COMMAND"))
 	if command == "" {
-		command = "docker load -i {archive}"
+		if strings.TrimSpace(os.Getenv("AEGIS_IMAGE_IMPORT_REGISTRY")) != "" {
+			command = "docker load -i {archive} && docker tag {image} {target_image} && docker push {target_image}"
+		} else {
+			command = "docker load -i {archive}"
+		}
 	}
 	command = strings.ReplaceAll(command, "{archive}", archivePath)
 	command = strings.ReplaceAll(command, "{image}", strings.TrimSpace(workload.Image))
+	command = strings.ReplaceAll(command, "{target_image}", strings.TrimSpace(targetImage))
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("import image archive for %s: %w: %s", workload.Image, err, strings.TrimSpace(string(output)))
 	}
-	log.Printf("[CreateSandbox] imported image archive for workload=%s image=%s", workload.Name, workload.Image)
+	log.Printf("[CreateSandbox] imported image archive for workload=%s image=%s target_image=%s", workload.Name, workload.Image, targetImage)
 	return nil
+}
+
+func remappedTopologyImage(workload TopologyWorkload) string {
+	image := strings.TrimSpace(workload.Image)
+	registry := strings.Trim(strings.TrimSpace(os.Getenv("AEGIS_IMAGE_IMPORT_REGISTRY")), "/")
+	if registry == "" || image == "" {
+		return image
+	}
+	repository := image
+	tag := "latest"
+	if parts := strings.SplitN(image, ":", 2); len(parts) == 2 {
+		repository = parts[0]
+		if strings.TrimSpace(parts[1]) != "" {
+			tag = parts[1]
+		}
+	}
+	return fmt.Sprintf("%s/%s:%s", registry, kubernetesName(repository), tag)
 }
 
 func downloadImageArchive(ctx context.Context, ref string, file *os.File) error {

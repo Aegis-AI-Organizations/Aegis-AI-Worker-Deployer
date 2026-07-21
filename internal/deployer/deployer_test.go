@@ -1610,11 +1610,44 @@ func TestImportTopologyImageArchivesDeduplicatesHTTPArchives(t *testing.T) {
 		{Name: "api", Image: "local-api:latest", ImageArchiveRef: server.URL + "/image.tar"},
 		{Name: "api-copy", Image: "local-api:latest", ImageArchiveRef: server.URL + "/image.tar"},
 	}
-	if err := importTopologyImageArchives(context.Background(), workloads); err != nil {
+	remapped, err := importTopologyImageArchives(context.Background(), workloads)
+	if err != nil {
 		t.Fatalf("importTopologyImageArchives returned error: %v", err)
 	}
 	if requests != 1 {
 		t.Fatalf("expected one archive download, got %d", requests)
+	}
+	if remapped[0].Image != "local-api:latest" || remapped[1].Image != "local-api:latest" {
+		t.Fatalf("expected images to stay unchanged without an import registry: %#v", remapped)
+	}
+}
+
+func TestImportTopologyImageArchivesRemapsLocalImagesOnly(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_, _ = w.Write([]byte("archive-bytes"))
+	}))
+	defer server.Close()
+	t.Setenv("AEGIS_IMAGE_IMPORT_REGISTRY", "registry.aegis.local:5000/cache")
+	t.Setenv("AEGIS_IMAGE_IMPORT_COMMAND", "test -s {archive}")
+
+	workloads := []TopologyWorkload{
+		{Name: "frontend", Image: "portfolio-frontend:dev", ImageArchiveRef: server.URL + "/frontend.tar"},
+		{Name: "api", Image: "ghcr.io/acme/api:latest", ImageArchiveRef: server.URL + "/api.tar"},
+	}
+	remapped, err := importTopologyImageArchives(context.Background(), workloads)
+	if err != nil {
+		t.Fatalf("importTopologyImageArchives returned error: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("expected one local image archive download, got %d", requests)
+	}
+	if got := remapped[0].Image; got != "registry.aegis.local:5000/cache/portfolio-frontend:dev" {
+		t.Fatalf("expected local image to be remapped, got %q", got)
+	}
+	if got := remapped[1].Image; got != "ghcr.io/acme/api:latest" {
+		t.Fatalf("expected registry-backed image to stay unchanged, got %q", got)
 	}
 }
 
