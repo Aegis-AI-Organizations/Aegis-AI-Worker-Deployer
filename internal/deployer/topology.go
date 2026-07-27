@@ -590,15 +590,18 @@ func normalizeSecretEnvValue(key, value string) string {
 func normalizeFunctionalEnvValue(key, value string, workload TopologyWorkload, workloads []TopologyWorkload) string {
 	upper := strings.ToUpper(strings.TrimSpace(key))
 	if strings.Contains(upper, "DATABASE_URL") {
-		return normalizeDependencyURL(value, workload, workloads, []string{"db", "postgres"}, 5432)
+		return normalizeDependencyURLOrMock(key, value, workload, workloads, []string{"db", "postgres"}, 5432)
 	}
 	if strings.Contains(upper, "REDIS_URL") {
-		return normalizeDependencyURL(value, workload, workloads, []string{"redis"}, 6379)
+		return normalizeDependencyURLOrMock(key, value, workload, workloads, []string{"redis"}, 6379)
 	}
 	if strings.Contains(upper, "BACKEND_URL") || strings.Contains(upper, "API_URL") {
-		return normalizeDependencyURL(value, workload, workloads, []string{"backend", "api"}, 8080)
+		return normalizeDependencyURLOrMock(key, value, workload, workloads, []string{"backend", "api"}, 8080)
 	}
-	if strings.Contains(upper, "URL") {
+	if strings.Contains(upper, "URL") || strings.Contains(upper, "URI") {
+		if !hasUsableURL(value) {
+			return mockFunctionalEnvValue(key, workload, workloads)
+		}
 		return normalizeNamedDependencyURL(upper, value, workload, workloads)
 	}
 	if strings.Contains(upper, "DB_HOST") || strings.HasSuffix(upper, "DATABASE_HOST") {
@@ -608,6 +611,18 @@ func normalizeFunctionalEnvValue(key, value string, workload TopologyWorkload, w
 		return normalizeDependencyHost(value, workload, workloads, "redis")
 	}
 	return value
+}
+
+func normalizeDependencyURLOrMock(key, value string, workload TopologyWorkload, workloads []TopologyWorkload, roles []string, fallbackPort int32) string {
+	if !hasUsableURL(value) {
+		return mockFunctionalEnvValue(key, workload, workloads)
+	}
+	return normalizeDependencyURL(value, workload, workloads, roles, fallbackPort)
+}
+
+func hasUsableURL(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	return err == nil && parsed.Scheme != "" && parsed.Host != ""
 }
 
 func normalizeDependencyURL(value string, workload TopologyWorkload, workloads []TopologyWorkload, roles []string, fallbackPort int32) string {
@@ -740,16 +755,30 @@ func isDocumentationIP(host string) bool {
 
 func replaceRedactedSecret(key, value, secret string, workload TopologyWorkload, workloads []TopologyWorkload) (string, bool) {
 	trimmedValue := strings.TrimSpace(value)
-	if !strings.EqualFold(trimmedValue, "REDACTED") && !strings.Contains(trimmedValue, "<REDACTED") {
+	if !isRedactedEnvValue(trimmedValue) {
 		return value, true
 	}
 	if !isSecretLikeEnvKey(key) {
-		return mockFunctionalEnvValue(key, workload, workloads), true
+		return mockFunctionalEnvValueWithSecret(key, workload, workloads, secret), true
 	}
 	return mockValueForEnvKey(key, secret), true
 }
 
+func isRedactedEnvValue(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	return strings.EqualFold(trimmed, "REDACTED") ||
+		strings.EqualFold(trimmed, "[REDACTED]") ||
+		strings.Contains(strings.ToUpper(trimmed), "<REDACTED")
+}
+
 func mockFunctionalEnvValue(key string, workload TopologyWorkload, workloads []TopologyWorkload) string {
+	return mockFunctionalEnvValueWithSecret(key, workload, workloads, topologyMockSecretPrefix)
+}
+
+func mockFunctionalEnvValueWithSecret(key string, workload TopologyWorkload, workloads []TopologyWorkload, secret string) string {
+	if secret == "" {
+		secret = topologyMockSecretPrefix
+	}
 	upper := strings.ToUpper(strings.TrimSpace(key))
 	ports := workload.normalizedPorts()
 	if isBooleanLikeEnvKey(upper) {
@@ -775,7 +804,7 @@ func mockFunctionalEnvValue(key string, workload TopologyWorkload, workloads []T
 	}
 	if strings.Contains(upper, "DATABASE_URL") {
 		host := preferredDependencyHost(workload, workloads, "db", "postgres")
-		return fmt.Sprintf("postgres://postgres:aegis-mock-secret@%s:5432/postgres", host)
+		return fmt.Sprintf("postgres://postgres:%s@%s:5432/postgres", secret, host)
 	}
 	if strings.Contains(upper, "REDIS_URL") {
 		host := preferredDependencyHost(workload, workloads, "redis")
@@ -792,6 +821,13 @@ func mockFunctionalEnvValue(key string, workload TopologyWorkload, workloads []T
 		return fmt.Sprintf("http://%s:%d", host, dependencyPort(workloads, host, 8080))
 	}
 	if strings.Contains(upper, "FRONTEND_URL") || upper == "URL" || strings.Contains(upper, "PUBLIC_URL") {
+		port := int32(80)
+		if len(ports) > 0 {
+			port = ports[0].servicePort()
+		}
+		return fmt.Sprintf("http://%s:%d", kubernetesName(workload.Name), port)
+	}
+	if strings.Contains(upper, "URL") || strings.Contains(upper, "URI") {
 		port := int32(80)
 		if len(ports) > 0 {
 			port = ports[0].servicePort()

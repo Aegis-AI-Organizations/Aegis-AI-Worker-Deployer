@@ -643,6 +643,9 @@ func TestMockFunctionalEnvValueBuildsUsableDefaults(t *testing.T) {
 	if got := mockFunctionalEnvValue("PUBLIC_URL", frontend, workloads); got != "http://portfolio-frontend:80" {
 		t.Fatalf("unexpected PUBLIC_URL mock: %q", got)
 	}
+	if got := mockFunctionalEnvValue("OIDC_AUTH_URI", outline, workloads); got != "http://outline-server:3000" {
+		t.Fatalf("unexpected OIDC_AUTH_URI mock: %q", got)
+	}
 	if got := mockFunctionalEnvValue("FORCE_HTTPS", frontend, workloads); got != "false" {
 		t.Fatalf("unexpected boolean mock: %q", got)
 	}
@@ -691,8 +694,14 @@ func TestNormalizeFunctionalEnvValueRewritesGenericDependencyHosts(t *testing.T)
 	if got := normalizeFunctionalEnvValue("DATABASE_URL", "postgres://postgres:secret@203.0.113.10:5432/portfolio_db", backend, workloads); got != "postgres://postgres:secret@portfolio-db:5432/portfolio_db" {
 		t.Fatalf("expected documentation IP database URL host rewrite, got %q", got)
 	}
+	if got := normalizeFunctionalEnvValue("DATABASE_URL", "postgresql://backend_user:aegis%mock@db:5432/portfolio_db", backend, workloads); got != "postgres://postgres:aegis-mock-secret@portfolio-db:5432/postgres" {
+		t.Fatalf("expected malformed database URL to be replaced with usable mock, got %q", got)
+	}
 	if got := normalizeFunctionalEnvValue("BACKEND_URL", "http://backend", frontend, workloads); got != "http://portfolio-backend:8080" {
 		t.Fatalf("expected backend URL host rewrite, got %q", got)
+	}
+	if got := normalizeFunctionalEnvValue("OIDC_AUTH_URI", "aegis-mock-value", gitea, workloads); got != "http://gitea:3000" {
+		t.Fatalf("expected invalid URI-like env to be replaced with service URL, got %q", got)
 	}
 	if got := normalizeFunctionalEnvValue("GITEA_INSTANCE_URL", "http://203.0.113.10:3000", runner, workloads); got != "http://gitea:3000" {
 		t.Fatalf("expected named documentation IP URL rewrite, got %q", got)
@@ -1283,7 +1292,8 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 					"name": "api",
 					"image": "node:20",
 					"env": {
-						"DB_PASS": "REDACTED",
+						"DB_PASS": "[REDACTED]",
+						"DATABASE_URL": "[REDACTED]",
 						"AWS_ACCESS_KEY_ID": "REDACTED",
 						"API_KEY": "REDACTED",
 						"JWT_SECRET": "REDACTED",
@@ -1298,7 +1308,7 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 				{
 					"name": "postgres",
 					"image": "postgres:16",
-					"env_vars": [{"name": "POSTGRES_PASSWORD", "value": "REDACTED"}],
+					"env_vars": [{"name": "POSTGRES_PASSWORD", "value": "[REDACTED]"}],
 					"ports": [{"port": 5432}]
 				}
 			]
@@ -1322,7 +1332,7 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 		if env.Name == "DB_PASS" {
 			apiPassword = env.Value
 		}
-		if env.Value == "REDACTED" {
+		if strings.Contains(env.Value, "REDACTED") {
 			t.Fatalf("api deployment still contains REDACTED: %#v", apiDeployment.Spec.Template.Spec.Containers[0].Env)
 		}
 	}
@@ -1339,7 +1349,7 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 		if env.Name == "POSTGRES_PASSWORD" {
 			postgresPassword = env.Value
 		}
-		if env.Value == "REDACTED" {
+		if strings.Contains(env.Value, "REDACTED") {
 			t.Fatalf("postgres deployment still contains REDACTED: %#v", postgresDeployment.Spec.Template.Spec.Containers[0].Env)
 		}
 	}
@@ -1351,6 +1361,9 @@ func TestCreateSandboxSanitizesRedactedSecretsAcrossWorkloads(t *testing.T) {
 	}
 	if !strings.HasPrefix(apiPassword, topologyMockSecretPrefix) {
 		t.Fatalf("unexpected mock secret format: %q", apiPassword)
+	}
+	if !strings.Contains(apiEnv["DATABASE_URL"], ":"+postgresPassword+"@") {
+		t.Fatalf("expected DATABASE_URL to use shared postgres mock password: %#v", apiEnv)
 	}
 	if apiEnv["AWS_ACCESS_KEY_ID"] != "AKIA0000000000000000" {
 		t.Fatalf("unexpected AWS_ACCESS_KEY_ID mock: %#v", apiEnv)
