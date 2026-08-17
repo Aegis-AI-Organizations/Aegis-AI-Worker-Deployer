@@ -588,6 +588,42 @@ func TestAllowedTopologyFlowsIncludesConnectionsAndRoutes(t *testing.T) {
 	}
 }
 
+func TestTopologyNetworkPolicyAllowsPentestWorkerIngress(t *testing.T) {
+	policy := topologyNetworkPolicy(
+		"aegis-war-room-scan-1",
+		"scan-1",
+		"aegis-target",
+		TopologyWorkload{Name: "aegis-target", Image: "python:3.12-alpine", Ports: []TopologyPort{{Port: 8080}}},
+		[]TopologyWorkload{{Name: "aegis-target", Image: "python:3.12-alpine", Ports: []TopologyPort{{Port: 8080}}}},
+		topologyFlowMap{},
+	)
+
+	if !ingressPeerExists(policy.Spec.Ingress, map[string]string{"app": "pentest-worker-mvp"}, int32(8080)) {
+		t.Fatalf("expected pentest worker ingress on 8080 in %s: %#v", policy.Name, policy.Spec.Ingress)
+	}
+	if !ingressNamespacePeerExists(policy.Spec.Ingress, map[string]string{"kubernetes.io/metadata.name": "aegis-system"}, int32(8080)) {
+		t.Fatalf("expected pentest worker namespace ingress on 8080 in %s: %#v", policy.Name, policy.Spec.Ingress)
+	}
+}
+
+func TestSandboxTopologyAcceptsWorkloadsAlias(t *testing.T) {
+	var topology SandboxTopology
+	if err := json.Unmarshal([]byte(`{
+		"workloads": [{"name":"aegis-target","image":"python:3.12-alpine","ports":[{"port":8080}]}],
+		"databaseSchemas": [],
+		"externalMocks": []
+	}`), &topology); err != nil {
+		t.Fatalf("unmarshal topology: %v", err)
+	}
+
+	if err := topology.validate(); err != nil {
+		t.Fatalf("workloads alias should validate: %v", err)
+	}
+	if got := topology.workloads(); len(got) != 1 || got[0].Name != "aegis-target" {
+		t.Fatalf("expected workloads alias to produce aegis-target, got %#v", got)
+	}
+}
+
 func TestAllowedTopologyFlowsInfersCommonAppDependencies(t *testing.T) {
 	workloads := []TopologyWorkload{
 		{Name: "portfolio-frontend", Image: "frontend", Env: map[string]string{"BACKEND_URL": "http://portfolio-backend:8080"}},
@@ -888,6 +924,17 @@ func ingressPeerExists(rules []networkingv1.NetworkPolicyIngressRule, labels map
 	for _, rule := range rules {
 		for _, peer := range rule.From {
 			if selectorMatchesLabels(peer.PodSelector, labels) && networkPolicyPortsContain(rule.Ports, port) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func ingressNamespacePeerExists(rules []networkingv1.NetworkPolicyIngressRule, labels map[string]string, port int32) bool {
+	for _, rule := range rules {
+		for _, peer := range rule.From {
+			if selectorMatchesLabels(peer.NamespaceSelector, labels) && networkPolicyPortsContain(rule.Ports, port) {
 				return true
 			}
 		}

@@ -144,7 +144,8 @@ func topologyNetworkPolicy(namespace, scanID, name string, workload TopologyWork
 				networkingv1.PolicyTypeIngress,
 				networkingv1.PolicyTypeEgress,
 			},
-			Egress: []networkingv1.NetworkPolicyEgressRule{externalMockEgressRule(scanID)},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{pentestWorkerIngressRule(workload.normalizedPorts())},
+			Egress:  []networkingv1.NetworkPolicyEgressRule{externalMockEgressRule(scanID)},
 		},
 	}
 
@@ -282,6 +283,16 @@ func topologyPeerEgressRule(scanID, target string, ports []TopologyPort) network
 func topologyPeerIngressRule(scanID, source string, ports []TopologyPort) networkingv1.NetworkPolicyIngressRule {
 	return networkingv1.NetworkPolicyIngressRule{
 		From:  []networkingv1.NetworkPolicyPeer{topologyPeer(scanID, source)},
+		Ports: topologyNetworkPolicyPorts(ports),
+	}
+}
+
+func pentestWorkerIngressRule(ports []TopologyPort) networkingv1.NetworkPolicyIngressRule {
+	return networkingv1.NetworkPolicyIngressRule{
+		From: []networkingv1.NetworkPolicyPeer{{
+			NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": "aegis-system"}},
+			PodSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "pentest-worker-mvp"}},
+		}},
 		Ports: topologyNetworkPolicyPorts(ports),
 	}
 }

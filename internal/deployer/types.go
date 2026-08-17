@@ -43,6 +43,7 @@ type SandboxDeploymentSummary struct {
 }
 
 type SandboxTopology struct {
+	Workloads       []TopologyWorkload     `json:"workloads,omitempty"`
 	Services        []TopologyWorkload     `json:"services,omitempty"`
 	Deployments     []TopologyWorkload     `json:"deployments,omitempty"`
 	Containers      []TopologyWorkload     `json:"containers,omitempty"`
@@ -228,6 +229,7 @@ type topologyWorkloadAlias struct {
 }
 
 type sandboxTopologyAlias struct {
+	Workloads            []TopologyWorkload     `json:"workloads,omitempty"`
 	Services             []TopologyWorkload     `json:"services,omitempty"`
 	Deployments          []TopologyWorkload     `json:"deployments,omitempty"`
 	Containers           []TopologyWorkload     `json:"containers,omitempty"`

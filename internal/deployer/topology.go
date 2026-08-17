@@ -109,6 +109,7 @@ func (t *SandboxTopology) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*t = SandboxTopology{
+		Workloads:       alias.Workloads,
 		Services:        alias.Services,
 		Deployments:     alias.Deployments,
 		Containers:      alias.Containers,
@@ -140,7 +141,8 @@ func (s *DatabaseSchema) UnmarshalJSON(data []byte) error {
 }
 
 func (t *SandboxTopology) workloads() []TopologyWorkload {
-	workloads := make([]TopologyWorkload, 0, len(t.Services)+len(t.Deployments)+len(t.Containers))
+	workloads := make([]TopologyWorkload, 0, len(t.Workloads)+len(t.Services)+len(t.Deployments)+len(t.Containers))
+	workloads = append(workloads, t.Workloads...)
 	workloads = append(workloads, t.Services...)
 	workloads = append(workloads, t.Deployments...)
 	workloads = append(workloads, t.Containers...)
