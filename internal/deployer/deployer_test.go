@@ -624,6 +624,53 @@ func TestSandboxTopologyAcceptsWorkloadsAlias(t *testing.T) {
 	}
 }
 
+func TestSandboxRequestParsesBrainTopologyContract(t *testing.T) {
+	req := SandboxRequest{
+		ScanID:                    "scan-1",
+		PreferredEndpointWorkload: "portfolio-web",
+		TopologyJSON: `{
+			"containers": [{
+				"id": "company-1:agent-1:web",
+				"name": "portfolio-web",
+				"image": "portfolio-web:local",
+				"image_archive_ref": "minio:archives/portfolio-web.tar",
+				"image_archive_object": "archives/portfolio-web.tar",
+				"ports": [{"number": 8080, "protocol": "tcp"}],
+				"env": {"DB_HOST": "portfolio-db"}
+			}],
+			"routes": [{"source": "portfolio-web", "target": "portfolio-db"}],
+			"databaseSchemas": [{
+				"engine": "postgres",
+				"host": "portfolio-db",
+				"port": 5432,
+				"databaseName": "portfolio",
+				"username": "portfolio",
+				"sourceContainerId": "company-1:agent-1:web",
+				"sourceContainerName": "portfolio-web"
+			}],
+			"externalMocks": []
+		}`,
+	}
+
+	topology, err := req.parseTopology()
+	if err != nil {
+		t.Fatalf("parseTopology returned error: %v", err)
+	}
+	workloads := topology.workloads()
+	if len(workloads) != 1 || workloads[0].ImageArchiveRef != "minio:archives/portfolio-web.tar" {
+		t.Fatalf("archive fields were not preserved: %#v", workloads)
+	}
+	if workloads[0].ImageArchiveObject != "archives/portfolio-web.tar" {
+		t.Fatalf("archive object was not preserved: %#v", workloads[0])
+	}
+	if len(topology.DatabaseSchemas) != 1 || topology.DatabaseSchemas[0].DatabaseName != "portfolio" {
+		t.Fatalf("databaseSchemas alias was not preserved: %#v", topology.DatabaseSchemas)
+	}
+	if topology.DatabaseSchemas[0].SourceContainerID != "company-1:agent-1:web" {
+		t.Fatalf("source container id was not preserved: %#v", topology.DatabaseSchemas[0])
+	}
+}
+
 func TestAllowedTopologyFlowsInfersCommonAppDependencies(t *testing.T) {
 	workloads := []TopologyWorkload{
 		{Name: "portfolio-frontend", Image: "frontend", Env: map[string]string{"BACKEND_URL": "http://portfolio-backend:8080"}},
