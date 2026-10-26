@@ -134,6 +134,12 @@ func TestCreateSandboxCreatesNamespacePodAndService(t *testing.T) {
 	if len(policy.Spec.Egress) != 2 || len(policy.Spec.Egress[0].Ports) != 2 || len(policy.Spec.Egress[1].Ports) != 4 {
 		t.Fatalf("expected kube DNS and external mock egress only, got %#v", policy.Spec.Egress)
 	}
+	if _, err := k8s.CoreV1().ResourceQuotas(response.Namespace).Get(ctx, "aegis-sandbox-quota", metav1.GetOptions{}); err != nil {
+		t.Fatalf("resource quota was not created: %v", err)
+	}
+	if _, err := k8s.CoreV1().LimitRanges(response.Namespace).Get(ctx, "aegis-sandbox-limits", metav1.GetOptions{}); err != nil {
+		t.Fatalf("limit range was not created: %v", err)
+	}
 }
 
 func fakeSandboxRuntimeClass() *nodev1.RuntimeClass {
@@ -243,6 +249,108 @@ func TestCreateSandboxAllowsExistingResources(t *testing.T) {
 
 	if _, err := activities.CreateSandbox(ctx, SandboxRequest{ScanID: "scan-1", TargetImage: "nginx:latest"}); err != nil {
 		t.Fatalf("CreateSandbox returned error for existing resources: %v", err)
+	}
+}
+
+func TestCreateSandboxCreatesResourceQuotaAndLimitRange(t *testing.T) {
+	ctx := context.Background()
+	k8s := fake.NewSimpleClientset()
+	k8s.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "target-scan-1", Namespace: "aegis-war-room-scan-1"},
+			Status: corev1.PodStatus{
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			},
+		}, nil
+	})
+	activities := NewActivities(k8s)
+
+	response, err := activities.CreateSandbox(ctx, SandboxRequest{ScanID: "scan-1", TargetImage: "nginx:latest"})
+	if err != nil {
+		t.Fatalf("CreateSandbox returned error: %v", err)
+	}
+
+	quota, err := k8s.CoreV1().ResourceQuotas(response.Namespace).Get(ctx, "aegis-sandbox-quota", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("resource quota was not created: %v", err)
+	}
+	if quota.Labels["aegis-scan"] != "scan-1" {
+		t.Fatalf("expected aegis-scan label on resource quota, got %#v", quota.Labels)
+	}
+	pods := quota.Spec.Hard[corev1.ResourcePods]
+	if pods.IsZero() {
+		t.Fatalf("expected pods hard limit, got %#v", quota.Spec.Hard)
+	}
+	reqCPU := quota.Spec.Hard[corev1.ResourceRequestsCPU]
+	if reqCPU.IsZero() {
+		t.Fatalf("expected requests.cpu hard limit, got %#v", quota.Spec.Hard)
+	}
+
+	lr, err := k8s.CoreV1().LimitRanges(response.Namespace).Get(ctx, "aegis-sandbox-limits", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("limit range was not created: %v", err)
+	}
+	if len(lr.Spec.Limits) != 1 || lr.Spec.Limits[0].Type != corev1.LimitTypeContainer {
+		t.Fatalf("expected one Container limit range item, got %#v", lr.Spec.Limits)
+	}
+	defCPU := lr.Spec.Limits[0].Default[corev1.ResourceCPU]
+	if defCPU.IsZero() {
+		t.Fatalf("expected default CPU limit, got %#v", lr.Spec.Limits[0].Default)
+	}
+	defReqMem := lr.Spec.Limits[0].DefaultRequest[corev1.ResourceMemory]
+	if defReqMem.IsZero() {
+		t.Fatalf("expected default request memory, got %#v", lr.Spec.Limits[0].DefaultRequest)
+	}
+}
+
+func TestCreateSandboxIsIdempotentForResourceQuotaAndLimitRange(t *testing.T) {
+	ctx := context.Background()
+	namespace := "aegis-war-room-scan-1"
+	k8s := fake.NewSimpleClientset(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}},
+		&corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: "aegis-sandbox-quota", Namespace: namespace}},
+		&corev1.LimitRange{ObjectMeta: metav1.ObjectMeta{Name: "aegis-sandbox-limits", Namespace: namespace}},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "target-scan-1", Namespace: namespace},
+			Status: corev1.PodStatus{
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			},
+		},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc-scan-1", Namespace: namespace}},
+	)
+	activities := NewActivities(k8s)
+
+	if _, err := activities.CreateSandbox(ctx, SandboxRequest{ScanID: "scan-1", TargetImage: "nginx:latest"}); err != nil {
+		t.Fatalf("CreateSandbox must be idempotent when quota and limitrange already exist: %v", err)
+	}
+}
+
+func TestCreateSandboxFailsOnResourceQuotaAndLimitRangeCreateErrors(t *testing.T) {
+	for name, reactor := range map[string]func(*fake.Clientset){
+		"resourcequotas": func(k8s *fake.Clientset) {
+			k8s.PrependReactor("create", "resourcequotas", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("quota denied")
+			})
+		},
+		"limitranges": func(k8s *fake.Clientset) {
+			k8s.PrependReactor("create", "limitranges", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("limitrange denied")
+			})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			k8s := fake.NewSimpleClientset()
+			reactor(k8s)
+			activities := NewActivities(k8s)
+
+			_, err := activities.CreateSandbox(context.Background(), SandboxRequest{
+				ScanID:      "scan-1",
+				TargetImage: "nginx:latest",
+			})
+			if err == nil || !strings.Contains(err.Error(), "denied") {
+				t.Fatalf("expected create error, got %v", err)
+			}
+		})
 	}
 }
 
