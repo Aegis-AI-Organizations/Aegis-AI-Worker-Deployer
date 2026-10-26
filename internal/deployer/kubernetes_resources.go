@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -364,6 +365,87 @@ func countTopologyFlows(flows topologyFlowMap) int {
 		count += len(targets)
 	}
 	return count
+}
+
+// envOrDefault returns the trimmed value of the env var key, or defaultValue
+// when the env var is unset or blank.
+func envOrDefault(key, defaultValue string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return defaultValue
+}
+
+func (a *Activities) createSandboxResourceQuota(ctx context.Context, namespace, scanID string) error {
+	quota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "aegis-sandbox-quota",
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "aegis-worker-deployer",
+				"aegis-scan":                   scanID,
+			},
+		},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceRequestsCPU:    resource.MustParse(envOrDefault(sandboxQuotaRequestsCPUEnv, defaultSandboxQuotaRequestsCPU)),
+				corev1.ResourceRequestsMemory: resource.MustParse(envOrDefault(sandboxQuotaRequestsMemEnv, defaultSandboxQuotaRequestsMem)),
+				corev1.ResourceLimitsCPU:      resource.MustParse(envOrDefault(sandboxQuotaLimitsCPUEnv, defaultSandboxQuotaLimitsCPU)),
+				corev1.ResourceLimitsMemory:   resource.MustParse(envOrDefault(sandboxQuotaLimitsMemEnv, defaultSandboxQuotaLimitsMem)),
+				corev1.ResourcePods:           resource.MustParse(envOrDefault(sandboxQuotaPodsEnv, defaultSandboxQuotaPods)),
+			},
+		},
+	}
+	_, err := a.k8s.CoreV1().ResourceQuotas(namespace).Create(ctx, quota, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		log.Printf("[CreateSandbox] resourcequota %s/%s already exists", namespace, quota.Name)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("create sandbox resource quota %s/%s: %w", namespace, quota.Name, err)
+	}
+	log.Printf("[CreateSandbox] resourcequota %s/%s created", namespace, quota.Name)
+	return nil
+}
+
+func (a *Activities) createSandboxLimitRange(ctx context.Context, namespace, scanID string) error {
+	limitRange := &corev1.LimitRange{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "aegis-sandbox-limits",
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "aegis-worker-deployer",
+				"aegis-scan":                   scanID,
+			},
+		},
+		Spec: corev1.LimitRangeSpec{
+			Limits: []corev1.LimitRangeItem{{
+				Type: corev1.LimitTypeContainer,
+				Default: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(envOrDefault(sandboxLRDefaultCPUEnv, defaultSandboxLRDefaultCPU)),
+					corev1.ResourceMemory: resource.MustParse(envOrDefault(sandboxLRDefaultMemEnv, defaultSandboxLRDefaultMem)),
+				},
+				DefaultRequest: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(envOrDefault(sandboxLRDefaultReqCPUEnv, defaultSandboxLRDefaultReqCPU)),
+					corev1.ResourceMemory: resource.MustParse(envOrDefault(sandboxLRDefaultReqMemEnv, defaultSandboxLRDefaultReqMem)),
+				},
+				Max: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(envOrDefault(sandboxLRMaxCPUEnv, defaultSandboxLRMaxCPU)),
+					corev1.ResourceMemory: resource.MustParse(envOrDefault(sandboxLRMaxMemEnv, defaultSandboxLRMaxMem)),
+				},
+			}},
+		},
+	}
+	_, err := a.k8s.CoreV1().LimitRanges(namespace).Create(ctx, limitRange, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		log.Printf("[CreateSandbox] limitrange %s/%s already exists", namespace, limitRange.Name)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("create sandbox limit range %s/%s: %w", namespace, limitRange.Name, err)
+	}
+	log.Printf("[CreateSandbox] limitrange %s/%s created", namespace, limitRange.Name)
+	return nil
 }
 
 func (a *Activities) sandboxRuntimeClassName(ctx context.Context) *string {

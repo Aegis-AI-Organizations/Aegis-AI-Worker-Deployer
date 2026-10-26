@@ -64,6 +64,12 @@ func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (res
 	if err := a.createSandboxNetworkPolicy(ctx, namespace, req.ScanID); err != nil {
 		return SandboxResponse{}, err
 	}
+	if err := a.createSandboxResourceQuota(ctx, namespace, req.ScanID); err != nil {
+		return SandboxResponse{}, err
+	}
+	if err := a.createSandboxLimitRange(ctx, namespace, req.ScanID); err != nil {
+		return SandboxResponse{}, err
+	}
 
 	if topology != nil {
 		response, err = a.createTopologySandbox(ctx, req.ScanID, namespace, topology, req.PreferredEndpointWorkload)
