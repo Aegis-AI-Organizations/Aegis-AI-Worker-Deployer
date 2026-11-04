@@ -45,7 +45,10 @@ const (
 	defaultSandboxLRDefaultReqCPU = "100m"
 	defaultSandboxLRDefaultReqMem = "128Mi"
 	defaultSandboxLRMaxCPU        = "1"
-	defaultSandboxLRMaxMem        = "1Gi"
+	// 2Gi, not 1Gi: must stay >= the jvm resource profile's 1536Mi limit
+	// below, or Kubernetes rejects any pod using that profile (LimitRange
+	// Max caps what a container's own explicit limits may declare).
+	defaultSandboxLRMaxMem = "2Gi"
 
 	// Resource profiles — named resource classes for the simple
 	// (non-topology) sandbox path, resolved by resourcesForProfile in
