@@ -21,6 +21,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	kwatch "k8s.io/apimachinery/pkg/watch"
@@ -330,6 +331,31 @@ func createdPodResourcesForRequest(t *testing.T, req SandboxRequest) corev1.Reso
 		t.Fatalf("target pod create was not observed")
 	}
 	return createdPod.Spec.Containers[0].Resources
+}
+
+func TestResourceProfileLimitsFitWithinSandboxLimitRangeMax(t *testing.T) {
+	maxCPU := resource.MustParse(envOrDefault(sandboxLRMaxCPUEnv, defaultSandboxLRMaxCPU))
+	maxMem := resource.MustParse(envOrDefault(sandboxLRMaxMemEnv, defaultSandboxLRMaxMem))
+
+	resources := resourcesForProfile(resourceProfileJVM)
+	if resources == nil {
+		t.Fatalf("expected a jvm profile to be defined")
+	}
+	limitCPU := resources.Limits[corev1.ResourceCPU]
+	limitMem := resources.Limits[corev1.ResourceMemory]
+
+	if limitCPU.Cmp(maxCPU) > 0 {
+		t.Fatalf(
+			"jvm profile CPU limit %s exceeds the sandbox LimitRange max %s; a real cluster would reject the pod",
+			limitCPU.String(), maxCPU.String(),
+		)
+	}
+	if limitMem.Cmp(maxMem) > 0 {
+		t.Fatalf(
+			"jvm profile memory limit %s exceeds the sandbox LimitRange max %s; a real cluster would reject the pod",
+			limitMem.String(), maxMem.String(),
+		)
+	}
 }
 
 func TestCreateSandboxAppliesJVMResourceProfileToPodContainer(t *testing.T) {
