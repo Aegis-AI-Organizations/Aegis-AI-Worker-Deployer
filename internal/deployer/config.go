@@ -18,11 +18,11 @@ const (
 	retainSandboxEnv         = "RETAIN_WAR_ROOM_NAMESPACES"
 
 	// Resource quota env vars and defaults — override to tune per-sandbox limits.
-	sandboxQuotaRequestsCPUEnv    = "SANDBOX_QUOTA_REQUESTS_CPU"
-	sandboxQuotaRequestsMemEnv    = "SANDBOX_QUOTA_REQUESTS_MEMORY"
-	sandboxQuotaLimitsCPUEnv      = "SANDBOX_QUOTA_LIMITS_CPU"
-	sandboxQuotaLimitsMemEnv      = "SANDBOX_QUOTA_LIMITS_MEMORY"
-	sandboxQuotaPodsEnv           = "SANDBOX_QUOTA_PODS"
+	sandboxQuotaRequestsCPUEnv = "SANDBOX_QUOTA_REQUESTS_CPU"
+	sandboxQuotaRequestsMemEnv = "SANDBOX_QUOTA_REQUESTS_MEMORY"
+	sandboxQuotaLimitsCPUEnv   = "SANDBOX_QUOTA_LIMITS_CPU"
+	sandboxQuotaLimitsMemEnv   = "SANDBOX_QUOTA_LIMITS_MEMORY"
+	sandboxQuotaPodsEnv        = "SANDBOX_QUOTA_PODS"
 	// Generous defaults: a topology with 10 services × 128Mi default request
 	// + external-api-mock (3 containers) already exceeds 512Mi.
 	// Operators can tighten via env vars after profiling real workloads.
@@ -34,25 +34,43 @@ const (
 
 	// LimitRange env vars and defaults — defaults prevent ResourceQuota from
 	// rejecting pods that declare no explicit resource requests/limits.
-	sandboxLRDefaultCPUEnv    = "SANDBOX_LIMITRANGE_DEFAULT_CPU"
-	sandboxLRDefaultMemEnv    = "SANDBOX_LIMITRANGE_DEFAULT_MEMORY"
-	sandboxLRDefaultReqCPUEnv = "SANDBOX_LIMITRANGE_DEFAULT_REQUEST_CPU"
-	sandboxLRDefaultReqMemEnv = "SANDBOX_LIMITRANGE_DEFAULT_REQUEST_MEMORY"
-	sandboxLRMaxCPUEnv        = "SANDBOX_LIMITRANGE_MAX_CPU"
-	sandboxLRMaxMemEnv        = "SANDBOX_LIMITRANGE_MAX_MEMORY"
+	sandboxLRDefaultCPUEnv        = "SANDBOX_LIMITRANGE_DEFAULT_CPU"
+	sandboxLRDefaultMemEnv        = "SANDBOX_LIMITRANGE_DEFAULT_MEMORY"
+	sandboxLRDefaultReqCPUEnv     = "SANDBOX_LIMITRANGE_DEFAULT_REQUEST_CPU"
+	sandboxLRDefaultReqMemEnv     = "SANDBOX_LIMITRANGE_DEFAULT_REQUEST_MEMORY"
+	sandboxLRMaxCPUEnv            = "SANDBOX_LIMITRANGE_MAX_CPU"
+	sandboxLRMaxMemEnv            = "SANDBOX_LIMITRANGE_MAX_MEMORY"
 	defaultSandboxLRDefaultCPU    = "200m"
 	defaultSandboxLRDefaultMem    = "256Mi"
 	defaultSandboxLRDefaultReqCPU = "100m"
 	defaultSandboxLRDefaultReqMem = "128Mi"
 	defaultSandboxLRMaxCPU        = "1"
 	defaultSandboxLRMaxMem        = "1Gi"
-	externalMockName         = "external-api-mock"
-	externalMockHTTPPort     = int32(8080)
-	externalMockHTTPSPort    = int32(8443)
-	externalMockDNSPort      = int32(53)
-	fallbackKubeDNSIP        = "10.43.0.10"
-	fallbackExternalMockIP   = "10.43.0.200"
-	defaultAegisRedactImage  = "ghcr.io/aegis-ai-organizations/aegis-ai-agent:latest"
+
+	// Resource profiles — named resource classes for the simple
+	// (non-topology) sandbox path, resolved by resourcesForProfile in
+	// kubernetes_resources.go. Unlike the LimitRange defaults above, these
+	// aren't global: a caller opts in per-request via
+	// SandboxRequest.ResourceProfile when a target needs more than a
+	// lightweight microservice (e.g. a JVM target OOM-killed by the
+	// 256Mi/200m default — see docker-vuln/cve-2017-5638's README).
+	resourceProfileJVM             = "jvm"
+	sandboxProfileJVMReqCPUEnv     = "SANDBOX_PROFILE_JVM_REQUEST_CPU"
+	sandboxProfileJVMReqMemEnv     = "SANDBOX_PROFILE_JVM_REQUEST_MEMORY"
+	sandboxProfileJVMLimCPUEnv     = "SANDBOX_PROFILE_JVM_LIMIT_CPU"
+	sandboxProfileJVMLimMemEnv     = "SANDBOX_PROFILE_JVM_LIMIT_MEMORY"
+	defaultSandboxProfileJVMReqCPU = "500m"
+	defaultSandboxProfileJVMReqMem = "512Mi"
+	defaultSandboxProfileJVMLimCPU = "1"
+	defaultSandboxProfileJVMLimMem = "1536Mi"
+
+	externalMockName        = "external-api-mock"
+	externalMockHTTPPort    = int32(8080)
+	externalMockHTTPSPort   = int32(8443)
+	externalMockDNSPort     = int32(53)
+	fallbackKubeDNSIP       = "10.43.0.10"
+	fallbackExternalMockIP  = "10.43.0.200"
+	defaultAegisRedactImage = "ghcr.io/aegis-ai-organizations/aegis-ai-agent:latest"
 )
 
 var (

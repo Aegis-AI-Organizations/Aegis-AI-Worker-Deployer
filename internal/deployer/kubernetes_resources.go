@@ -460,13 +460,47 @@ func (a *Activities) sandboxRuntimeClassName(ctx context.Context) *string {
 	return ptrString(runtimeClassName)
 }
 
-func (a *Activities) createPod(ctx context.Context, namespace, podName, scanID, image, mockDNSIP string) error {
+// resourcesForProfile resolves a named SandboxRequest.ResourceProfile to
+// container resources. Empty or unknown profiles return nil, leaving the
+// container's Resources unset so the namespace LimitRange governs.
+func resourcesForProfile(profile string) *corev1.ResourceRequirements {
+	switch strings.TrimSpace(profile) {
+	case resourceProfileJVM:
+		return &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse(envOrDefault(sandboxProfileJVMReqCPUEnv, defaultSandboxProfileJVMReqCPU)),
+				corev1.ResourceMemory: resource.MustParse(envOrDefault(sandboxProfileJVMReqMemEnv, defaultSandboxProfileJVMReqMem)),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse(envOrDefault(sandboxProfileJVMLimCPUEnv, defaultSandboxProfileJVMLimCPU)),
+				corev1.ResourceMemory: resource.MustParse(envOrDefault(sandboxProfileJVMLimMemEnv, defaultSandboxProfileJVMLimMem)),
+			},
+		}
+	default:
+		return nil
+	}
+}
+
+func (a *Activities) createPod(ctx context.Context, namespace, podName, scanID, image, mockDNSIP, resourceProfile string) error {
 	runtimeClassName := a.sandboxRuntimeClassName(ctx)
 	dnsPolicy := corev1.DNSClusterFirst
 	var dnsConfig *corev1.PodDNSConfig
 	if strings.TrimSpace(mockDNSIP) != "" {
 		dnsPolicy = corev1.DNSNone
 		dnsConfig = sandboxDNSConfig(namespace, mockDNSIP)
+	}
+	container := corev1.Container{
+		Name:            "target-container",
+		Image:           image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Ports: []corev1.ContainerPort{{
+			ContainerPort: 80,
+		}},
+	}
+	if resources := resourcesForProfile(resourceProfile); resources != nil {
+		container.Resources = *resources
+	} else if strings.TrimSpace(resourceProfile) != "" {
+		log.Printf("[CreateSandbox] scan=%s unknown resource profile %q; leaving container resources unset", scanID, resourceProfile)
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -480,15 +514,8 @@ func (a *Activities) createPod(ctx context.Context, namespace, podName, scanID, 
 			RuntimeClassName: runtimeClassName,
 			DNSPolicy:        dnsPolicy,
 			DNSConfig:        dnsConfig,
-			Containers: []corev1.Container{{
-				Name:            "target-container",
-				Image:           image,
-				ImagePullPolicy: corev1.PullIfNotPresent,
-				Ports: []corev1.ContainerPort{{
-					ContainerPort: 80,
-				}},
-			}},
-			RestartPolicy: corev1.RestartPolicyNever,
+			Containers:       []corev1.Container{container},
+			RestartPolicy:    corev1.RestartPolicyNever,
 		},
 	}
 
