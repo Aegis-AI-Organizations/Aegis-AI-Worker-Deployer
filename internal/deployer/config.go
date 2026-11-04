@@ -45,10 +45,10 @@ const (
 	defaultSandboxLRDefaultReqCPU = "100m"
 	defaultSandboxLRDefaultReqMem = "128Mi"
 	defaultSandboxLRMaxCPU        = "1"
-	// 2Gi, not 1Gi: must stay >= the jvm resource profile's 1536Mi limit
+	// 5Gi, not 1Gi: must stay >= the jvm resource profile's 4Gi limit
 	// below, or Kubernetes rejects any pod using that profile (LimitRange
 	// Max caps what a container's own explicit limits may declare).
-	defaultSandboxLRMaxMem = "2Gi"
+	defaultSandboxLRMaxMem = "5Gi"
 
 	// Resource profiles — named resource classes for the simple
 	// (non-topology) sandbox path, resolved by resourcesForProfile in
@@ -65,7 +65,15 @@ const (
 	defaultSandboxProfileJVMReqCPU = "500m"
 	defaultSandboxProfileJVMReqMem = "512Mi"
 	defaultSandboxProfileJVMLimCPU = "1"
-	defaultSandboxProfileJVMLimMem = "1536Mi"
+	// 4Gi, not 1536Mi: measured live against aegis-cve-2017-5638.
+	// 1536Mi OOM-killed it ~49s after boot even idle, from its own
+	// Maven/Jetty startup spike (idle steady-state settles ~550-600Mi).
+	// 2560Mi survived idle but still got OOM-killed ~90s into an actual
+	// nuclei scan -- the CVE-tagged template run's concurrent request
+	// load against this old Jetty app drives memory well past idle
+	// usage. 4Gi leaves real headroom for that load instead of chasing
+	// the exact minimum.
+	defaultSandboxProfileJVMLimMem = "4Gi"
 
 	externalMockName        = "external-api-mock"
 	externalMockHTTPPort    = int32(8080)
