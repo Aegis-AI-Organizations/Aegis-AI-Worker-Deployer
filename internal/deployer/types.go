@@ -13,6 +13,11 @@ type SandboxRequest struct {
 	Topology                  *SandboxTopology `json:"topology,omitempty"`
 	TopologyJSON              string           `json:"topology_json,omitempty"`
 	PreferredEndpointWorkload string           `json:"preferred_endpoint_workload,omitempty"`
+	// ResourceProfile names a resource class (see resourceProfileJVM in
+	// config.go) for the simple (non-topology) sandbox path. Empty or
+	// unknown values leave the container's Resources unset, so the
+	// namespace LimitRange governs as before.
+	ResourceProfile string `json:"resource_profile,omitempty"`
 }
 
 type SandboxResponse struct {

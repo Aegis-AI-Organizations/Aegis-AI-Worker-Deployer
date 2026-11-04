@@ -303,6 +303,69 @@ func TestCreateSandboxCreatesResourceQuotaAndLimitRange(t *testing.T) {
 	}
 }
 
+func createdPodResourcesForRequest(t *testing.T, req SandboxRequest) corev1.ResourceRequirements {
+	t.Helper()
+	ctx := context.Background()
+	k8s := fake.NewSimpleClientset()
+	var createdPod *corev1.Pod
+	k8s.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		pod := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod)
+		createdPod = pod
+		return true, pod, nil
+	})
+	k8s.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "target-scan-1", Namespace: "aegis-war-room-scan-1"},
+			Status: corev1.PodStatus{
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			},
+		}, nil
+	})
+	activities := NewActivities(k8s)
+
+	if _, err := activities.CreateSandbox(ctx, req); err != nil {
+		t.Fatalf("CreateSandbox returned error: %v", err)
+	}
+	if createdPod == nil {
+		t.Fatalf("target pod create was not observed")
+	}
+	return createdPod.Spec.Containers[0].Resources
+}
+
+func TestCreateSandboxAppliesJVMResourceProfileToPodContainer(t *testing.T) {
+	resources := createdPodResourcesForRequest(t, SandboxRequest{
+		ScanID:          "scan-1",
+		TargetImage:     "aegis-cve-2017-5638:latest",
+		ResourceProfile: "jvm",
+	})
+	limitMem := resources.Limits[corev1.ResourceMemory]
+	if limitMem.IsZero() {
+		t.Fatalf("expected jvm profile to set a memory limit on the container, got %#v", resources)
+	}
+	reqMem := resources.Requests[corev1.ResourceMemory]
+	if reqMem.IsZero() {
+		t.Fatalf("expected jvm profile to set a memory request on the container, got %#v", resources)
+	}
+}
+
+func TestCreateSandboxLeavesContainerResourcesUnsetWithoutProfile(t *testing.T) {
+	resources := createdPodResourcesForRequest(t, SandboxRequest{ScanID: "scan-1", TargetImage: "nginx:latest"})
+	if len(resources.Limits) != 0 || len(resources.Requests) != 0 {
+		t.Fatalf("expected no explicit resources without a profile, got %#v", resources)
+	}
+}
+
+func TestCreateSandboxIgnoresUnknownResourceProfile(t *testing.T) {
+	resources := createdPodResourcesForRequest(t, SandboxRequest{
+		ScanID:          "scan-1",
+		TargetImage:     "nginx:latest",
+		ResourceProfile: "does-not-exist",
+	})
+	if len(resources.Limits) != 0 || len(resources.Requests) != 0 {
+		t.Fatalf("expected an unknown profile to leave resources unset, got %#v", resources)
+	}
+}
+
 func TestCreateSandboxIsIdempotentForResourceQuotaAndLimitRange(t *testing.T) {
 	ctx := context.Background()
 	namespace := "aegis-war-room-scan-1"

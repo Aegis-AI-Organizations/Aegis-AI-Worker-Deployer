@@ -89,7 +89,7 @@ func (a *Activities) CreateSandbox(ctx context.Context, req SandboxRequest) (res
 	}
 
 	log.Printf("[CreateSandbox] scan=%s creating pod %s/%s", req.ScanID, namespace, podName)
-	if err := a.createPod(ctx, namespace, podName, req.ScanID, req.TargetImage, mockDNSIP); err != nil {
+	if err := a.createPod(ctx, namespace, podName, req.ScanID, req.TargetImage, mockDNSIP, req.ResourceProfile); err != nil {
 		return SandboxResponse{}, err
 	}
 	log.Printf("[CreateSandbox] scan=%s pod %s/%s created", req.ScanID, namespace, podName)
